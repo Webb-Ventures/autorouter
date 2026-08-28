@@ -1,9 +1,11 @@
 # Releasing
 
-Publishing is driven entirely by a version tag. Pushing `vX.Y.Z` runs
+Publishing is driven entirely by a release branch. Pushing `release/vX.Y.Z` runs
 [`.github/workflows/publish.yml`](.github/workflows/publish.yml), which publishes
-to npm, then to the [MCP registry](https://registry.modelcontextprotocol.io), then
-cuts a GitHub release.
+to npm, then to the [MCP registry](https://registry.modelcontextprotocol.io),
+creates the matching `vX.Y.Z` tag, and cuts a GitHub release. The tag is only
+created after both registries accept the release, so a failed publish never tags
+an unpublished commit.
 
 ## One-time setup
 
@@ -100,26 +102,28 @@ sed -i '' "s/const VERSION = \".*\"/const VERSION = \"$VERSION\"/" src/cli.ts
 node .github/scripts/check-release-metadata.mjs "v$VERSION"
 bun test && bun run typecheck && bun run build
 
-# 4. commit, then tag
+# 4. commit, create the release branch, and push it
 git commit -am "Release v$VERSION"
-git push
-git tag "v$VERSION" && git push origin "v$VERSION"
+git switch -c "release/v$VERSION"
+git push -u origin "release/v$VERSION"
 ```
 
-The workflow re-runs the metadata check, the tests and the build *before*
-publishing anything, because both an npm version and a git tag are immutable
-once out.
+The workflow derives the tag from the branch name and checks it against all three
+version declarations. It re-runs the metadata check, tests and build *before*
+publishing anything, because npm versions and git tags are immutable once out.
+
+Any later push to the same release branch starts the workflow again. Once its tag
+exists, it must still point to that branch's commit; the workflow refuses to move
+an existing release tag.
 
 ## If it fails halfway
 
-- **Failed before `npm publish`** — fix, delete the tag (`git push --delete origin vX.Y.Z`),
-  re-tag. Nothing was published.
+- **Failed before `npm publish`** — fix the release branch and push it again.
+  Nothing was published or tagged.
 - **npm succeeded, the registry step failed** — do not bump the npm version. Fix
-  `server.json` and re-run the workflow via **Actions → Publish → Run workflow**
-  with the same tag; `mcp-publisher` is idempotent for a version it has not
-  accepted yet. Note the re-run publishes to npm again and that step will fail on
-  the already-published version, so re-run only after the npm step is expected
-  to be a no-op, or run `mcp-publisher` locally.
+  the release branch and push again, or run **Actions → Publish → Run workflow**
+  with the same tag. The workflow detects the existing npm version and skips
+  publishing it again; `mcp-publisher` can then retry the registry release.
 - **`ENEEDAUTH` or `E404` on `npm publish`** — almost always trusted publishing,
   not a missing token. Check, in order: the workflow filename registered on
   npmjs.com is exactly `publish.yml`; `id-token: write` is present; npm is

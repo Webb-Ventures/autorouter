@@ -2,19 +2,27 @@ name: Publish
 
 on:
   push:
-    tags: ["v*"]
+    branches: ["release/v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to publish, e.g. v0.1.0"
+        description: "Release version to publish from release/<tag>, e.g. v0.1.0"
         required: true
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: publish-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
     permissions:
       # OIDC, used twice: npm trusted publishing and the MCP registry login.
       # Between them the release needs no stored credential at all.
@@ -24,7 +32,37 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: release/${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('release/{0}', inputs.tag) || github.sha }}
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: release
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF_NAME#release/}"
+          fi
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release branches must be named release/vX.Y.Z (optional prerelease/build suffixes are supported)"
+            exit 1
+          fi
+
+          SHA=$(git rev-parse HEAD)
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            TAG_SHA=$(git rev-list -n 1 "$TAG")
+            if [ "$TAG_SHA" != "$SHA" ]; then
+              echo "::error::$TAG already points to $TAG_SHA; refusing to publish $SHA"
+              exit 1
+            fi
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Publishing $TAG from ${SHA:0:7}"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -56,7 +94,7 @@ jobs:
       # A tag is immutable and npm versions cannot be reused, so everything that
       # can fail is made to fail before anything is published.
       - name: Check release metadata
-        run: node .github/scripts/check-release-metadata.mjs "${{ github.event.inputs.tag || github.ref_name }}"
+        run: node .github/scripts/check-release-metadata.mjs "${{ steps.release.outputs.tag }}"
 
       - name: Typecheck
         run: bun run typecheck
@@ -76,7 +114,14 @@ jobs:
       # credential. Provenance is generated automatically on a trusted publish,
       # so `--provenance` is not passed either.
       - name: Publish to npm
-        run: npm publish
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          NAME=$(node -p "require('./package.json').name")
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "$NAME@$VERSION is already live on npm; skipping publish"
+          else
+            npm publish
+          fi
 
       # The registry verifies the npm package exists and carries a matching
       # `mcpName` before it will accept server.json. npm's read path is
@@ -111,19 +156,56 @@ jobs:
       - name: Publish to the MCP registry
         run: ./mcp-publisher publish
 
-  release:
-    name: GitHub release
+  tag:
+    name: Git tag
     needs: publish
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ needs.publish.outputs.sha }}
           fetch-depth: 0
 
+      - name: Create the release tag
+        env:
+          RELEASE_SHA: ${{ needs.publish.outputs.sha }}
+          RELEASE_TAG: ${{ needs.publish.outputs.tag }}
+        run: |
+          git fetch --force --tags origin
+
+          if git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG" >/dev/null; then
+            TAG_SHA=$(git rev-list -n 1 "$RELEASE_TAG")
+            if [ "$TAG_SHA" != "$RELEASE_SHA" ]; then
+              echo "::error::$RELEASE_TAG already points to $TAG_SHA, not $RELEASE_SHA"
+              exit 1
+            fi
+            echo "$RELEASE_TAG already points to the published commit"
+          else
+            git tag "$RELEASE_TAG" "$RELEASE_SHA"
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
+
+  release:
+    name: GitHub release
+    needs: [publish, tag]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
       - name: Create the release
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.publish.outputs.sha }}
+          RELEASE_TAG: ${{ needs.publish.outputs.tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub release $RELEASE_TAG already exists"
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$RELEASE_SHA" \
+              --generate-notes \
+              --verify-tag
+          fi
