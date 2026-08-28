@@ -11,7 +11,7 @@ import { renderCapability, renderRouteResult, oneLine } from "./server/render.ts
 import type { CapabilityKind } from "./catalog/types.ts";
 import { loadCatalog } from "./catalog/build.ts";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.1";
 
 const USAGE = `autorouter — one search tool instead of every tool
 
