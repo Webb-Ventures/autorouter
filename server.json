@@ -15,8 +15,15 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "autorouter-mcp",
       "version": "0.1.0",
-      "transport": { "type": "stdio" },
-      "packageArguments": [{ "type": "positional", "value": "serve" }],
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "serve"
+        }
+      ],
       "environmentVariables": [
         {
           "name": "AUTOROUTER_CONFIG",

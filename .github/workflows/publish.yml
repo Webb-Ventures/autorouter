@@ -18,16 +18,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
+  prepare:
+    name: Prepare release metadata
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.release.outputs.tag }}
-      sha: ${{ steps.release.outputs.sha }}
+      sha: ${{ steps.metadata.outputs.sha }}
     permissions:
-      # OIDC, used twice: npm trusted publishing and the MCP registry login.
-      # Between them the release needs no stored credential at all.
-      id-token: write
-      contents: read
+      contents: write
 
     steps:
       - uses: actions/checkout@v5
@@ -51,18 +49,64 @@ jobs:
             exit 1
           fi
 
-          SHA=$(git rev-parse HEAD)
           if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
             TAG_SHA=$(git rev-list -n 1 "$TAG")
-            if [ "$TAG_SHA" != "$SHA" ]; then
-              echo "::error::$TAG already points to $TAG_SHA; refusing to publish $SHA"
+            CURRENT_SHA=$(git rev-parse HEAD)
+            if [ "$TAG_SHA" != "$CURRENT_SHA" ]; then
+              echo "::error::$TAG already points to $TAG_SHA; refusing to publish $CURRENT_SHA"
               exit 1
             fi
           fi
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "branch=release/$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Synchronize version metadata
+        run: bun .github/scripts/set-release-version.mjs "${{ steps.release.outputs.tag }}"
+
+      - name: Commit version metadata
+        id: metadata
+        env:
+          RELEASE_BRANCH: ${{ steps.release.outputs.branch }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          if git diff --quiet -- package.json server.json src/cli.ts; then
+            echo "Version metadata already matches $RELEASE_TAG"
+          else
+            if git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG" >/dev/null; then
+              echo "::error::$RELEASE_TAG already exists; refusing to change its release metadata"
+              exit 1
+            fi
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add package.json server.json src/cli.ts
+            git commit -m "chore(release): set version to ${RELEASE_TAG#v}"
+            git push origin "HEAD:refs/heads/$RELEASE_BRANCH"
+          fi
+
+          SHA=$(git rev-parse HEAD)
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "Publishing $TAG from ${SHA:0:7}"
+          echo "Publishing $RELEASE_TAG from ${SHA:0:7}"
+
+  publish:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      # OIDC, used twice: npm trusted publishing and the MCP registry login.
+      # Between them the release needs no stored credential at all.
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -94,7 +138,7 @@ jobs:
       # A tag is immutable and npm versions cannot be reused, so everything that
       # can fail is made to fail before anything is published.
       - name: Check release metadata
-        run: node .github/scripts/check-release-metadata.mjs "${{ steps.release.outputs.tag }}"
+        run: node .github/scripts/check-release-metadata.mjs "${{ needs.prepare.outputs.tag }}"
 
       - name: Typecheck
         run: bun run typecheck
@@ -158,20 +202,20 @@ jobs:
 
   tag:
     name: Git tag
-    needs: publish
+    needs: [prepare, publish]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.publish.outputs.sha }}
+          ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
 
       - name: Create the release tag
         env:
-          RELEASE_SHA: ${{ needs.publish.outputs.sha }}
-          RELEASE_TAG: ${{ needs.publish.outputs.tag }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           git fetch --force --tags origin
 
@@ -189,7 +233,7 @@ jobs:
 
   release:
     name: GitHub release
-    needs: [publish, tag]
+    needs: [prepare, publish, tag]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -197,8 +241,8 @@ jobs:
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_SHA: ${{ needs.publish.outputs.sha }}
-          RELEASE_TAG: ${{ needs.publish.outputs.tag }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "GitHub release $RELEASE_TAG already exists"

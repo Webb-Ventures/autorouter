@@ -2,10 +2,12 @@
 
 Publishing is driven entirely by a release branch. Pushing `release/vX.Y.Z` runs
 [`.github/workflows/publish.yml`](.github/workflows/publish.yml), which publishes
-to npm, then to the [MCP registry](https://registry.modelcontextprotocol.io),
-creates the matching `vX.Y.Z` tag, and cuts a GitHub release. The tag is only
-created after both registries accept the release, so a failed publish never tags
-an unpublished commit.
+the branch version into `package.json` and the matching release metadata, commits
+that update to the branch, publishes to npm and the
+[MCP registry](https://registry.modelcontextprotocol.io), creates the matching
+`vX.Y.Z` tag, and cuts a GitHub release. The tag is only created after both
+registries accept the release, so a failed publish never tags an unpublished
+commit.
 
 ## One-time setup
 
@@ -79,8 +81,8 @@ under `io.github.webb-ventures/`.
 
 ## Cutting a release
 
-Three files carry the version and all three must agree — CI enforces this on
-every PR via `.github/scripts/check-release-metadata.mjs`:
+The version comes from the release branch name. The workflow writes it to all
+three version-bearing files and commits the result before publishing:
 
 | file | field |
 |---|---|
@@ -91,26 +93,21 @@ every PR via `.github/scripts/check-release-metadata.mjs`:
 ```sh
 VERSION=0.2.0
 
-# 1. bump all three
-npm version "$VERSION" --no-git-tag-version
-jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > tmp && mv tmp server.json
-sed -i '' "s/const VERSION = \".*\"/const VERSION = \"$VERSION\"/" src/cli.ts
+# 1. move the Unreleased section of CHANGELOG.md under a new heading
 
-# 2. move the Unreleased section of CHANGELOG.md under a new heading
-
-# 3. check locally exactly as CI will
-node .github/scripts/check-release-metadata.mjs "v$VERSION"
+# 2. check locally
 bun test && bun run typecheck && bun run build
 
-# 4. commit, create the release branch, and push it
+# 3. commit, create the release branch, and push it
 git commit -am "Release v$VERSION"
 git switch -c "release/v$VERSION"
 git push -u origin "release/v$VERSION"
 ```
 
-The workflow derives the tag from the branch name and checks it against all three
-version declarations. It re-runs the metadata check, tests and build *before*
-publishing anything, because npm versions and git tags are immutable once out.
+The workflow derives the version from the branch name, synchronizes the three
+version declarations, and pushes a `chore(release)` commit when they changed. It
+then checks the result and runs the tests and build *before* publishing anything,
+because npm versions and git tags are immutable once out.
 
 Any later push to the same release branch starts the workflow again. Once its tag
 exists, it must still point to that branch's commit; the workflow refuses to move
