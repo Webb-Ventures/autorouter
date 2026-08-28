@@ -1,0 +1,44 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.webb-ventures/autorouter",
+  "title": "autorouter",
+  "description": "An MCP capability router: one search tool instead of every server's tool schema.",
+  "version": "0.1.0",
+  "websiteUrl": "https://github.com/Webb-Ventures/autorouter",
+  "repository": {
+    "url": "https://github.com/Webb-Ventures/autorouter",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "autorouter-mcp",
+      "version": "0.1.0",
+      "transport": { "type": "stdio" },
+      "packageArguments": [{ "type": "positional", "value": "serve" }],
+      "environmentVariables": [
+        {
+          "name": "AUTOROUTER_CONFIG",
+          "description": "Path to autorouter.json. Defaults to the standard lookup chain (./.autorouter.json, ~/.config/autorouter/config.json, …).",
+          "isRequired": false
+        },
+        {
+          "name": "AUTOROUTER_IMPORT",
+          "description": "Comma-separated harness configs to import: claude, codex, cursor, vscode, plugins.",
+          "isRequired": false
+        },
+        {
+          "name": "AUTOROUTER_SELECTOR_MODE",
+          "description": "Reranker backend: auto | sampling | cli | api | off.",
+          "isRequired": false
+        },
+        {
+          "name": "AUTOROUTER_SELECTOR_MODEL",
+          "description": "Model the selector reranks with, e.g. haiku.",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}

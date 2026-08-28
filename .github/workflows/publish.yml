@@ -1,0 +1,129 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      # OIDC, used twice: npm trusted publishing and the MCP registry login.
+      # Between them the release needs no stored credential at all.
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v5
+        with:
+          # Trusted publishing needs Node >= 22.14.0.
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      # setup-node ships whatever npm was bundled with that Node release, which
+      # is routinely older than 11.5.1 — the first version that can exchange the
+      # OIDC token for a publish. Without this the job fails with a misleading
+      # ENEEDAUTH or E404, so the version is asserted rather than assumed.
+      - name: Ensure npm supports trusted publishing
+        run: |
+          npm install -g npm@latest
+          VERSION=$(npm --version)
+          echo "npm $VERSION"
+          MIN=11.5.1
+          if [ "$(printf '%s\n%s\n' "$MIN" "$VERSION" | sort -V | head -1)" != "$MIN" ]; then
+            echo "::error::npm $VERSION is older than $MIN; trusted publishing will fail with a misleading ENEEDAUTH/E404"
+            exit 1
+          fi
+
+      - run: bun install --frozen-lockfile
+
+      # A tag is immutable and npm versions cannot be reused, so everything that
+      # can fail is made to fail before anything is published.
+      - name: Check release metadata
+        run: node .github/scripts/check-release-metadata.mjs "${{ github.event.inputs.tag || github.ref_name }}"
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun test
+
+      - name: Build
+        run: bun run build
+
+      - name: Smoke-test the Node build
+        run: node dist/cli.js --version
+
+      ### npm
+
+      # No NODE_AUTH_TOKEN: the OIDC token from `id-token: write` is the
+      # credential. Provenance is generated automatically on a trusted publish,
+      # so `--provenance` is not passed either.
+      - name: Publish to npm
+        run: npm publish
+
+      # The registry verifies the npm package exists and carries a matching
+      # `mcpName` before it will accept server.json. npm's read path is
+      # eventually consistent, so give it a moment rather than racing it.
+      - name: Wait for npm to serve the new version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          NAME=$(node -p "require('./package.json').name")
+          for i in $(seq 1 30); do
+            if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+              echo "$NAME@$VERSION is live on npm"
+              exit 0
+            fi
+            echo "attempt $i: not visible yet, waiting…"
+            sleep 10
+          done
+          echo "::error::$NAME@$VERSION never became visible on npm"
+          exit 1
+
+      ### MCP registry
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Validate server.json
+        run: ./mcp-publisher validate
+
+      - name: Authenticate to the MCP registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to the MCP registry
+        run: ./mcp-publisher publish
+
+  release:
+    name: GitHub release
+    needs: publish
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Create the release
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}

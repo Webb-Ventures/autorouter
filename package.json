@@ -1,0 +1,68 @@
+{
+  "name": "autorouter-mcp",
+  "version": "0.1.0",
+  "description": "One search tool instead of every tool: an MCP capability router for Claude Code, Codex, Cursor and anything else that speaks MCP.",
+  "mcpName": "io.github.webb-ventures/autorouter",
+  "license": "MIT",
+  "author": "Webb Ventures",
+  "homepage": "https://github.com/Webb-Ventures/autorouter#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Webb-Ventures/autorouter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Webb-Ventures/autorouter/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mcp-server",
+    "router",
+    "claude-code",
+    "codex",
+    "cursor",
+    "context",
+    "tools",
+    "agent"
+  ],
+  "type": "module",
+  "bin": {
+    "autorouter": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "server.json"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "bun build src/cli.ts --target=node --outfile dist/cli.js",
+    "serve": "bun run src/cli.ts serve",
+    "doctor": "bun run src/cli.ts doctor",
+    "test": "bun test",
+    "prepublishOnly": "bun run build",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "peerDependenciesMeta": {
+    "typescript": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "smol-toml": "^1.8.0"
+  }
+}
