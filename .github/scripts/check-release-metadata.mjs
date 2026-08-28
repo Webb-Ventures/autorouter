@@ -18,6 +18,14 @@ else if (pkg.mcpName !== server.name) {
   errors.push(`package.json mcpName (${pkg.mcpName}) != server.json name (${server.name}).`);
 }
 
+const repositoryUrl = typeof pkg.repository === "string" ? pkg.repository : pkg.repository?.url;
+const githubOwner = repositoryUrl?.match(/github\.com[/:]([^/]+)\//)?.[1];
+if (githubOwner && pkg.mcpName && !pkg.mcpName.startsWith(`io.github.${githubOwner}/`)) {
+  errors.push(
+    `package.json mcpName (${pkg.mcpName}) must preserve the GitHub owner casing: io.github.${githubOwner}/*.`,
+  );
+}
+
 if (pkg.version !== server.version) {
   errors.push(`package.json version (${pkg.version}) != server.json version (${server.version}).`);
 }

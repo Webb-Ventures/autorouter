@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.webb-ventures/autorouter",
+  "name": "io.github.Webb-Ventures/autorouter",
   "title": "autorouter",
   "description": "An MCP capability router: one search tool instead of every server's tool schema.",
   "version": "0.1.0",

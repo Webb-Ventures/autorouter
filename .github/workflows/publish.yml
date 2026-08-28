@@ -161,7 +161,13 @@ jobs:
         run: |
           VERSION=$(node -p "require('./package.json').version")
           NAME=$(node -p "require('./package.json').name")
+          EXPECTED_MCP_NAME=$(node -p "require('./package.json').mcpName")
           if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            PUBLISHED_MCP_NAME=$(npm view "$NAME@$VERSION" mcpName 2>/dev/null || true)
+            if [ "$PUBLISHED_MCP_NAME" != "$EXPECTED_MCP_NAME" ]; then
+              echo "::error::$NAME@$VERSION is already published with mcpName '$PUBLISHED_MCP_NAME', expected '$EXPECTED_MCP_NAME'. npm versions are immutable; create a new release version."
+              exit 1
+            fi
             echo "$NAME@$VERSION is already live on npm; skipping publish"
           else
             npm publish

@@ -62,7 +62,8 @@ for the bootstrap publish, if you made one.
 
 Nothing to configure. `mcp-publisher login github-oidc` authenticates from the
 repository's own GitHub identity, which is why `server.json`'s name must stay
-under `io.github.webb-ventures/`.
+under `io.github.Webb-Ventures/`. The registry matches this namespace
+case-sensitively against the GitHub organization returned by OIDC.
 
 ### What the workflow relies on
 
@@ -120,7 +121,13 @@ an existing release tag.
 - **npm succeeded, the registry step failed** — do not bump the npm version. Fix
   the release branch and push again, or run **Actions → Publish → Run workflow**
   with the same tag. The workflow detects the existing npm version and skips
-  publishing it again; `mcp-publisher` can then retry the registry release.
+  publishing it again when its `mcpName` matches; `mcp-publisher` can then retry
+  the registry release.
+- **Registry `403 Forbidden` with a differently cased allowed namespace** — set
+  `package.json#mcpName` and `server.json#name` to the exact namespace reported
+  by the registry. GitHub organization casing is significant. If npm already
+  accepted the version with the wrong `mcpName`, create a new release version;
+  npm packages are immutable and the workflow will refuse to reuse it.
 - **`ENEEDAUTH` or `E404` on `npm publish`** — almost always trusted publishing,
   not a missing token. Check, in order: the workflow filename registered on
   npmjs.com is exactly `publish.yml`; `id-token: write` is present; npm is
@@ -135,5 +142,5 @@ an existing release tag.
 
 ```sh
 npx autorouter-mcp@latest --version
-curl -s "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.webb-ventures/autorouter" | jq
+curl -s "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.Webb-Ventures/autorouter" | jq
 ```
