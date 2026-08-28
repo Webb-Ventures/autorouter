@@ -3,7 +3,7 @@
   "name": "io.github.webb-ventures/autorouter",
   "title": "autorouter",
   "description": "An MCP capability router: one search tool instead of every server's tool schema.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "websiteUrl": "https://github.com/Webb-Ventures/autorouter",
   "repository": {
     "url": "https://github.com/Webb-Ventures/autorouter",
@@ -14,7 +14,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "autorouter-mcp",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "transport": { "type": "stdio" },
       "packageArguments": [{ "type": "positional", "value": "serve" }],
       "environmentVariables": [
