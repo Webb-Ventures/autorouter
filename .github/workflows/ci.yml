@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun test
+
+      - name: Build
+        run: bun run build
+
+      # The build targets Node so `npx` works for people without Bun; make sure
+      # the artifact actually runs there, not just under the toolchain that made it.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+
+      - name: Smoke-test the Node build
+        run: node dist/cli.js --version
+
+  package:
+    name: package contents
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+
+      - name: Verify the published tarball
+        run: npm pack --dry-run
+
+      # server.json's version and the npm identifier are what the registry
+      # verifies against package.json; a mismatch only shows up at release time.
+      - name: Check server.json agrees with package.json
+        run: node .github/scripts/check-release-metadata.mjs

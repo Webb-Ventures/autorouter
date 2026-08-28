@@ -1,0 +1,51 @@
+name: Bug report
+description: Something does not work as documented
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what happened, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: autorouter doctor
+      description: >
+        Output of `autorouter doctor` (or `--json`). This shows which servers are
+        reachable and where context is going, and answers most questions at once.
+        Redact any tokens before pasting.
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: autorouter version
+      placeholder: "autorouter --version"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: harness
+    attributes:
+      label: Harness
+      multiple: true
+      options:
+        - Claude Code
+        - Codex
+        - Cursor
+        - VS Code
+        - Other / CLI only
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: OS and runtime
+      placeholder: "macOS 15.6, Bun 1.3.14 / Node 20"
+    validations:
+      required: true
