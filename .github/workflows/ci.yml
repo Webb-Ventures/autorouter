@@ -41,7 +41,7 @@ jobs:
 
       # The build targets Node so `npx` works for people without Bun; make sure
       # the artifact actually runs there, not just under the toolchain that made it.
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
 
@@ -58,7 +58,7 @@ jobs:
         with:
           bun-version: latest
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
 
