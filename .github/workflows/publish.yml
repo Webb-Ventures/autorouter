@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: release/${{ github.event.inputs.tag || github.ref }}
 
       - uses: oven-sh/setup-bun@v2
         with:
