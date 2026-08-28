@@ -15,12 +15,15 @@ function updateJsonVersions(path) {
   JSON.parse(source);
 
   const versionField = /("version"\s*:\s*")[^"]+(")/g;
-  if (!versionField.test(source)) {
+  if (![...source.matchAll(versionField)].length) {
     console.error(`Could not find a version field in ${path}`);
     process.exit(1);
   }
 
-  const updated = source.replace(versionField, `$1${version}$2`);
+  const updated = source.replace(
+    versionField,
+    (_match, prefix, suffix) => `${prefix}${version}${suffix}`,
+  );
   JSON.parse(updated);
   if (updated !== source) writeFileSync(path, updated);
 }
