@@ -10,18 +10,23 @@ if (!version || !/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+
   process.exit(1);
 }
 
-const packagePath = "package.json";
-const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
-packageJson.version = version;
-writeFileSync(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
+function updateJsonVersions(path) {
+  const source = readFileSync(path, "utf8");
+  JSON.parse(source);
 
-const serverPath = "server.json";
-const serverJson = JSON.parse(readFileSync(serverPath, "utf8"));
-serverJson.version = version;
-for (const pkg of serverJson.packages ?? []) {
-  if (pkg.registryType === "npm") pkg.version = version;
+  const versionField = /("version"\s*:\s*")[^"]+(")/g;
+  if (!versionField.test(source)) {
+    console.error(`Could not find a version field in ${path}`);
+    process.exit(1);
+  }
+
+  const updated = source.replace(versionField, `$1${version}$2`);
+  JSON.parse(updated);
+  if (updated !== source) writeFileSync(path, updated);
 }
-writeFileSync(serverPath, `${JSON.stringify(serverJson, null, 2)}\n`);
+
+updateJsonVersions("package.json");
+updateJsonVersions("server.json");
 
 const cliPath = "src/cli.ts";
 const cli = readFileSync(cliPath, "utf8");
@@ -30,6 +35,7 @@ if (!versionDeclaration.test(cli)) {
   console.error(`Could not find const VERSION in ${cliPath}`);
   process.exit(1);
 }
-writeFileSync(cliPath, cli.replace(versionDeclaration, `const VERSION = "${version}"`));
+const updatedCli = cli.replace(versionDeclaration, `const VERSION = "${version}"`);
+if (updatedCli !== cli) writeFileSync(cliPath, updatedCli);
 
 console.log(`Release metadata set to ${version}`);
