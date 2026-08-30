@@ -366,9 +366,10 @@ describe("schema compaction", () => {
 describe("prompt list stays cheap", () => {
   test("clamps descriptions written for humans", () => {
     const long = "A skill that does something. " + "Extra detail for a reader. ".repeat(30);
-    const [prompt] = promptList([
-      { id: "skill:x", kind: "skill", name: "x", description: long, keywords: [], approxTokens: 1 },
-    ] as any).filter((p) => p.name === "x");
+    const [prompt] = promptList(
+      [{ id: "skill:x", kind: "skill", name: "x", description: long, keywords: [], approxTokens: 1 }] as any,
+      "all",
+    ).filter((p) => p.name === "x");
     expect(prompt!.description!.length).toBeLessThan(200);
     expect(prompt!.description).toContain("A skill that does something");
   });

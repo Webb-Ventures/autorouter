@@ -70,6 +70,45 @@ export type RouterConfig = {
   alwaysExpose: string[];
   /** Capability id globs requiring an explicit confirm:true on call. */
   confirm: string[];
+  /**
+   * Which instruction capabilities are republished as slash commands.
+   *
+   * "all"      - every skill, command and agent.
+   * "commands" - plugin commands and agents only.
+   * "none"     - just the search entry point.
+   *
+   * The prompt list is permanent context: the host fetches it once and carries
+   * it for the session. Publishing every skill is what makes that expensive —
+   * a single plugin shipping 141 skills costs ~11.5k tokens on every turn, for
+   * slash commands the harness mostly still offers natively. Skills stay
+   * searchable at any setting; only the /mcp__autorouter__<name> alias goes.
+   */
+  promptMode: "all" | "commands" | "none";
+  /**
+   * When a matched tool is promoted into the host's own tool list.
+   *
+   * "eager" - on every search hit, up to the budget.
+   * "lazy"  - only after the tool has actually been called once.
+   * "off"   - never; everything runs through call_capability.
+   *
+   * A promoted tool is permanent context for the rest of the session, so
+   * promoting on search spends it on tools the model merely looked at. Lazy
+   * spends it only on proven use, and the search result carries an inline
+   * schema either way.
+   */
+  activation: "eager" | "lazy" | "off";
+  /**
+   * Move servers out of a harness config and behind the router automatically.
+   *
+   * Without this, installing a server is two steps — `claude mcp add foo` then
+   * `autorouter adopt` — and forgetting the second leaves every one of that
+   * server's schemas in your context, which is the cost the router exists to
+   * remove. With it, the harness stays a working front door. Servers only:
+   * skills and plugins are never touched unprompted.
+   */
+  autoAdopt: boolean;
+  /** Expose the add_server tool, letting the model register a server mid-session. */
+  allowAddServer: boolean;
   selector: SelectorConfig;
   embeddings: EmbeddingsConfig;
   /** Fusion weight for the lexical score; embedding weight is 1 - this. */
@@ -85,6 +124,10 @@ export const DEFAULT_CONFIG: RouterConfig = {
   exclude: [],
   alwaysExpose: [],
   confirm: [],
+  promptMode: "commands",
+  activation: "lazy",
+  autoAdopt: true,
+  allowAddServer: true,
   selector: {
     mode: "auto",
     candidates: 30,

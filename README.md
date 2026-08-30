@@ -12,9 +12,12 @@ handful of skills is routinely 20–30k tokens of permanent overhead, paid wheth
 or not the task touches any of them. It also makes tool selection _worse_: more
 candidates means more mis-picks.
 
-autorouter is an MCP server that exposes ~4 stable tools and hides everything
-else behind a search. The model asks for what it needs in natural language, gets
-back a few ranked candidates, reads one schema, and calls it through the router.
+autorouter is an MCP server that exposes a handful of stable tools and hides
+everything else behind a search. The model asks for what it needs in natural
+language, gets back a few ranked candidates with schemas attached, and calls one
+through the router. A tool it actually uses is then promoted into the real tool
+list, so the context is spent on what the session needs rather than on what it
+might.
 
 ```
 find_capabilities({ query: "inspect recent deployment errors" })
@@ -33,6 +36,9 @@ npm install -g autorouter-mcp        # or: npx autorouter-mcp <command>
 autorouter init --target claude      # claude | codex | cursor | vscode
 autorouter adopt --target claude     # ← the step that actually saves context
 ```
+
+That is a one-time migration of what you already have. New servers do not need
+it — see [Adding an MCP server](#adding-an-mcp-server).
 
 **`adopt` is not optional.** Registering the router alongside your existing
 servers is a net _increase_: their schemas are still loaded and the router adds
@@ -72,21 +78,24 @@ Run `autorouter doctor` to see the difference:
 
 ```
 ## Context cost
-  exposing everything: ~12,400 tokens
-  router surface:      ~700 tokens
-  still loaded direct: ~11,700 tokens (10,800 servers + 900 skills)
-  actually saved:      ~0 tokens per request (0%)
+  exposing everything: ~87,524 tokens
+  router surface:      ~972 tokens
+  best case:           ~86,552 tokens saved (99%)
+
+  per harness (a session only ever runs in one):
+    codex   still loaded ~35,500 → saves ~51,052 (58%)
+    claude, cursor, vscode: fully adopted → saves ~86,552 (99%)
 
 ## Not yet adopted
-  claude
+  codex
     servers: project-tools, docs-search, issue-tracker
-    plugins: ui-toolkit
-    skills: code-review, incident-response
-    → autorouter adopt --target claude
+    → autorouter adopt --target codex
 ```
 
-That "still loaded direct" line is what adoption removes. Every removal is backed
-up verbatim to `~/.autorouter/adopted/` before anything is written;
+"Still loaded" is what adoption removes, and it is reported per harness rather
+than summed: a session runs in exactly one, so a server still registered in Codex
+costs a Claude Code session nothing. Every removal is backed up verbatim to
+`~/.autorouter/adopted/` before anything is written;
 `autorouter restore --target claude` puts it back byte for byte.
 
 ## How it finds things
@@ -169,11 +178,41 @@ when one of its capabilities is first called.
 | `skill`                      | `**/SKILL.md` under your skill paths and plugin `skills/` dirs  |
 | `command`, `agent`           | plugin `commands/*.md` and `agents/*.md`                        |
 
-Skills, commands and agents are also republished as [slash commands](#slash-commands).
+Plugin commands and agents are also republished as [slash commands](#slash-commands);
+skills are searchable but not republished by default, because the prompt list
+that would carry them is permanent context — see [Slash commands](#slash-commands).
 
 Harness configs are imported rather than duplicated: `~/.claude.json` (global and
 per-project) and `.mcp.json`, `~/.codex/config.toml`, `~/.cursor/mcp.json`,
 `~/.vscode/mcp.json`, and installed Claude Code plugins.
+
+## Adding an MCP server
+
+Register it with the router directly — it never enters anyone's context:
+
+```sh
+autorouter add linear --url https://mcp.linear.app/mcp
+autorouter add foo -- npx -y foo-mcp            # stdio, like `claude mcp add`
+autorouter add --json '{"mcpServers":{"linear":{"url":"…"}}}'   # paste the vendor snippet
+autorouter remove linear
+```
+
+The entry is saved before the connection is checked, because the usual reason a
+new server does not answer is that it has no OAuth grant yet — and
+`autorouter login <name>` needs the entry to exist before it can authorize it.
+
+**You can also just use the harness.** `claude mcp add foo …` still works: a
+running router notices the harness config changed, moves the entry into its own
+config with the usual backup, and tells you on the next search. So there is no
+second command to remember, and no window where you have forgotten it and are
+paying for that server's schemas on every turn. Set `"autoAdopt": false` to keep
+adoption manual.
+
+**From inside a session**, ask for it in words — the router exposes an
+`add_server` tool. Registering a stdio server means this machine will run that
+command from then on, so the first call only reports what would be registered;
+it takes a second call with `confirm: true` to write anything. Set
+`"allowAddServer": false` to withdraw the tool.
 
 ## Configuration
 
@@ -188,6 +227,10 @@ per-project) and `.mcp.json`, `~/.codex/config.toml`, `~/.cursor/mcp.json`,
   "exclude": ["media.generate_video"], // never surfaced at all
   "alwaysExpose": ["code-search.search"], // stays first-class, never adopted
   "confirm": ["database.execute_statement"], // first call is rejected, must re-issue
+  "autoAdopt": true, // move servers added to a harness behind the router
+  "allowAddServer": true, // expose the add_server tool to the model
+  "promptMode": "commands", // slash commands: "all" | "commands" | "none"
+  "activation": "lazy", // promote to a real tool: "eager" | "lazy" | "off"
   "selector": { "mode": "auto" },
   "embeddings": {
     "provider": "voyage",
@@ -198,7 +241,9 @@ per-project) and `.mcp.json`, `~/.codex/config.toml`, `~/.cursor/mcp.json`,
 ```
 
 Env overrides (`AUTOROUTER_IMPORT`, `AUTOROUTER_SELECTOR_MODEL`,
-`AUTOROUTER_SELECTOR_MODE`, `AUTOROUTER_EMBEDDINGS_PROVIDER`, …) let each harness
+`AUTOROUTER_SELECTOR_MODE`, `AUTOROUTER_PROMPT_MODE`, `AUTOROUTER_ACTIVATION`,
+`AUTOROUTER_AUTO_ADOPT`, `AUTOROUTER_ALLOW_ADD_SERVER`,
+`AUTOROUTER_EMBEDDINGS_PROVIDER`, …) let each harness
 pin its own behaviour without a shared global file. `AUTOROUTER_HOME` redirects
 every home-relative path, for tests and containers.
 
@@ -206,14 +251,23 @@ every home-relative path, for tests and containers.
 
 Adopting a plugin into the router would otherwise cost you its slash commands:
 Claude Code reads `commands/*.md` off disk, and nothing over MCP can add to that
-list. What it _does_ surface as slash commands are MCP prompts, so every skill,
-plugin command and subagent in the catalog is republished as one:
+list. What it _does_ surface as slash commands are MCP prompts, so the catalog's
+plugin commands and subagents are republished as ones:
 
 ```
 /mcp__autorouter__find <what you want to do>
 /mcp__autorouter__plugin_name_command_name
-/mcp__autorouter__skill_name
 ```
+
+**Skills are not republished by default** (`promptMode: "commands"`). The prompt
+list is permanent context — the host fetches it once and carries it for the whole
+session — and skills are the bulk of it: one plugin shipping 141 of them costs
+~11.5k tokens on every turn, which is more than adopting that plugin saves. The
+alias is also mostly redundant, since `adopt --skill-mode user-invocable-only`
+leaves a local skill's native `/name` working and a plugin's skills are surfaced
+by the harness on demand rather than injected. Skills stay fully searchable
+either way; set `"promptMode": "all"` to get `/mcp__autorouter__skill_name` back,
+or `"none"` to publish only `find`.
 
 Bodies are substituted the way the native loader substitutes them — `$ARGUMENTS`
 for everything you typed, `$1`..`$9` positionally — so a command file written for
@@ -233,12 +287,18 @@ summary — the same information a native tool listing carries, because a trunca
 description leaves the model guessing argument names, and a guessed argument is
 the whole difference between roughly reliable and reliable.
 
-Better still, where the client honours `notifications/tools/list_changed`,
-`find_capabilities` **promotes** what it matched to real first-class tools. The
-model then makes an ordinary tool call: the host validates arguments against the
-real schema, the permission prompt names the real tool rather than
-`call_capability`, and the router is not in the execution path at all. It becomes
-a loader that decides what is in your tool list, not a middleman on every call.
+Better still, where the client honours `notifications/tools/list_changed`, a tool
+you **use** is **promoted** to a real first-class tool. From then on the model
+makes an ordinary tool call: the host validates arguments against the real
+schema, the permission prompt names the real tool rather than `call_capability`,
+and the router is not in the execution path at all. It becomes a loader that
+decides what is in your tool list, not a middleman on every call.
+
+Promotion is deferred to the first successful call (`activation: "lazy"`) because
+a promoted tool is permanent context and a search hit is not evidence of need —
+most of what a search matches is never called. Set `"activation": "eager"` to
+promote every hit as before, or `"off"` to route everything through
+`call_capability` and carry no tool definitions at all.
 
 | supports `listChanged`                          | proxy only                                       |
 | ----------------------------------------------- | ------------------------------------------------ |
@@ -261,12 +321,16 @@ the model happened to search for.
 
 | surface                   | budget                            | lifetime   |
 | ------------------------- | --------------------------------- | ---------- |
-| promoted tool list        | 3,000 tok, LRU eviction           | session    |
-| inline schemas per search | 700 tok, spent top-down           | one result |
-| prompt list               | descriptions clamped to 180 chars | session    |
+| promoted tool list        | 3,000 tok, LRU eviction, on use only | session    |
+| inline schemas per search | 700 tok, spent top-down              | one result |
+| prompt list               | commands only, clamped to 120 chars  | session    |
 
-Tools promoted by the search in flight are never evicted — a tool that vanishes
+The tool promoted by the call in flight is never evicted — a tool that vanishes
 between being offered and being called is worse than one never offered.
+
+`autorouter doctor` reports the real bill per harness rather than summing across
+them, since a session only ever runs in one: a server still registered in Cursor
+costs a Claude Code session nothing.
 
 Schemas are **compacted** everywhere they are repeated: `$schema`, `title` and
 `examples` are dropped, and prose is trimmed, more aggressively the deeper it
@@ -290,6 +354,10 @@ autorouter call mcp:deployments/get_logs --args '{"lines":50}'
 autorouter list --kind skill
 autorouter doctor
 autorouter reindex
+
+autorouter add linear --url https://mcp.linear.app/mcp
+autorouter add foo -- npx -y foo-mcp
+autorouter remove linear
 
 autorouter adopt --target claude --dry-run          # preview, change nothing
 autorouter adopt --target claude --servers-only     # skip skills and plugins

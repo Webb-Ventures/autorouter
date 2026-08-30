@@ -43,6 +43,7 @@ describe("catalog", () => {
     const tools = router.catalog.capabilities.filter((c) => c.kind === "tool");
     expect(tools.map((t) => t.name).sort()).toEqual([
       "bloated_report",
+      "explode",
       "list_backups",
       "render_bar_chart",
       "restart_container",

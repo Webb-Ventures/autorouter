@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -16,12 +16,22 @@ const FIXTURE = join(import.meta.dir, "fixtures", "fake-mcp-server.ts");
  * the process before it could answer `initialize` — the server printed "ready"
  * and died, so it worked in no harness at all.
  */
-async function connect(clientName: string, clientVersion: string) {
+async function connect(
+  clientName: string,
+  clientVersion: string,
+  overrides: Record<string, unknown> = {},
+) {
   const dir = await mkdtemp(join(tmpdir(), "autorouter-serve-"));
   const config = join(dir, "autorouter.json");
   await writeFile(
     config,
-    JSON.stringify({ import: [], skillPaths: [], selector: { mode: "off" }, servers: { fake: { command: "bun", args: [FIXTURE] } } }),
+    JSON.stringify({
+      import: [],
+      skillPaths: [],
+      selector: { mode: "off" },
+      servers: { fake: { command: "bun", args: [FIXTURE] } },
+      ...overrides,
+    }),
   );
   const client = new Client({ name: clientName, version: clientVersion }, { capabilities: {} });
   const transport = new StdioClientTransport({
@@ -32,6 +42,35 @@ async function connect(clientName: string, clientVersion: string) {
   });
   await client.connect(transport);
   return { client, cleanup: async () => { await client.close(); await rm(dir, { recursive: true, force: true }); } };
+}
+
+/** Same, but hands back the config path so a test can assert what was written. */
+async function connectWithConfig(clientName: string, clientVersion: string) {
+  const dir = await mkdtemp(join(tmpdir(), "autorouter-add-"));
+  const configPath = join(dir, "autorouter.json");
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      import: [],
+      skillPaths: [],
+      selector: { mode: "off" },
+      servers: { fake: { command: "bun", args: [FIXTURE] } },
+    }),
+  );
+  const client = new Client({ name: clientName, version: clientVersion }, { capabilities: {} });
+  await client.connect(
+    new StdioClientTransport({
+      command: "bun",
+      args: ["run", CLI, "serve"],
+      env: { ...process.env, AUTOROUTER_CONFIG: configPath, AUTOROUTER_CACHE_DIR: join(dir, "cache"), AUTOROUTER_HOME: dir },
+      stderr: "ignore",
+    }),
+  );
+  return {
+    client,
+    configPath,
+    cleanup: async () => { await client.close(); await rm(dir, { recursive: true, force: true }); },
+  };
 }
 
 describe("serve over stdio", () => {
@@ -144,26 +183,39 @@ describe("catalog staleness tracks OAuth grants", () => {
   }, 30_000);
 });
 
-describe("search promotes tools to first-class", () => {
+describe("use promotes tools to first-class", () => {
   /**
-   * The reliability requirement: after a search, the model should be able to
-   * make an ordinary tool call. Not a proxied one described in prose — a real
-   * one the host validates against the real schema.
+   * The reliability requirement, and where the cost of meeting it is paid.
+   *
+   * A tool definition in the host's list is permanent context for the session,
+   * so it is spent on evidence of need rather than evidence of interest: a
+   * search hit only means the model looked at something, a completed call means
+   * it used it. So the first call goes through the proxy with the schema the
+   * search inlined, and the tool is native from the second call on.
    */
-  test("a matched tool becomes natively callable on a list_changed client", async () => {
+  test("a called tool becomes natively callable on a list_changed client", async () => {
     const { client, cleanup } = await connect("claude-code", "2.1.240");
     try {
-      const before = (await client.listTools()).tools.map((t) => t.name);
-      expect(before).not.toContain("fake__run_sql_query");
-
       const res: any = await client.callTool({
         name: "find_capabilities",
         arguments: { query: "run a database query" },
       });
-      expect(res.content[0].text).toContain("fake__run_sql_query");
+      expect(res.content[0].text).toContain("mcp:fake/run_sql_query");
+      // Searching is not using. Promoting here would spend the budget on the
+      // four hits the model is about to ignore.
+      expect((await client.listTools()).tools.map((t) => t.name)).not.toContain(
+        "fake__run_sql_query",
+      );
 
-      const after = (await client.listTools()).tools;
-      const promoted = after.find((t) => t.name === "fake__run_sql_query");
+      const proxied: any = await client.callTool({
+        name: "call_capability",
+        arguments: { id: "mcp:fake/run_sql_query", arguments: { sql: "select 1" } },
+      });
+      expect(proxied.isError).toBeFalsy();
+
+      const promoted = (await client.listTools()).tools.find(
+        (t) => t.name === "fake__run_sql_query",
+      );
       expect(promoted).toBeDefined();
       // The schema has to be the real one — a promoted tool the host cannot
       // validate arguments against is no better than the proxy.
@@ -174,6 +226,71 @@ describe("search promotes tools to first-class", () => {
         arguments: { sql: "select 1" },
       });
       expect(direct.isError).toBeFalsy();
+    } finally {
+      await cleanup();
+    }
+  }, 30_000);
+
+  /**
+   * A failed call is as likely to mean the model picked the wrong capability as
+   * that it needs this one again — and the context a promotion occupies is
+   * permanent either way.
+   */
+  test("a failed call does not promote", async () => {
+    const { client, cleanup } = await connect("claude-code", "2.1.240");
+    try {
+      const res: any = await client.callTool({
+        name: "call_capability",
+        arguments: { id: "mcp:fake/explode", arguments: {} },
+      });
+      expect(res.isError).toBeTruthy();
+      expect((await client.listTools()).tools.map((t) => t.name)).not.toContain("fake__explode");
+    } finally {
+      await cleanup();
+    }
+  }, 30_000);
+
+  /**
+   * Deferring promotion is only affordable if the search result carries enough
+   * to make that first call. It has to, on every client — not just the ones
+   * that cannot promote at all.
+   */
+  test("a list_changed client still gets inline schemas from search", async () => {
+    const { client, cleanup } = await connect("claude-code", "2.1.240");
+    try {
+      const res: any = await client.callTool({
+        name: "find_capabilities",
+        arguments: { query: "run a database query" },
+      });
+      const text = res.content[0].text as string;
+      expect(text).toContain("arguments:");
+      expect(text).toContain('"sql"');
+    } finally {
+      await cleanup();
+    }
+  }, 30_000);
+
+  /**
+   * "off" is the setting for anyone who would rather every downstream call show
+   * up as call_capability than carry any tool definitions at all. It has to
+   * withdraw the activate/deactivate pair too, or the model is holding two tool
+   * definitions for something the server will refuse to do.
+   */
+  test("activation: off never promotes and withdraws the activate tools", async () => {
+    const { client, cleanup } = await connect("claude-code", "2.1.240", { activation: "off" });
+    try {
+      const names = (await client.listTools()).tools.map((t) => t.name);
+      expect(names).not.toContain("activate_capabilities");
+      expect(names).not.toContain("deactivate_capabilities");
+
+      const res: any = await client.callTool({
+        name: "call_capability",
+        arguments: { id: "mcp:fake/run_sql_query", arguments: { sql: "select 1" } },
+      });
+      expect(res.isError).toBeFalsy();
+      expect((await client.listTools()).tools.map((t) => t.name)).not.toContain(
+        "fake__run_sql_query",
+      );
     } finally {
       await cleanup();
     }
@@ -208,22 +325,26 @@ describe("search promotes tools to first-class", () => {
   test("the promoted tool list stays inside its token budget", async () => {
     const { client, cleanup } = await connect("claude-code", "2.1.240");
     try {
-      for (const query of [
-        "build a wide analytics report",
-        "run a database query",
-        "render a bar chart",
-        "restart a container",
-        "list database backups",
-      ]) {
-        await client.callTool({ name: "find_capabilities", arguments: { query } });
+      // bloated_report first and list_backups last: the tool promoted by the
+      // call in flight is never evicted, so the order is what proves eviction
+      // ran rather than the corpus simply fitting.
+      for (const [id, args] of [
+        ["mcp:fake/bloated_report", {}],
+        ["mcp:fake/run_sql_query", { sql: "select 1" }],
+        ["mcp:fake/render_bar_chart", { labels: [], values: [] }],
+        ["mcp:fake/restart_container", { name: "api" }],
+        ["mcp:fake/list_backups", {}],
+      ] as const) {
+        await client.callTool({ name: "call_capability", arguments: { id, arguments: args } });
       }
 
       const tools = (await client.listTools()).tools;
       const promoted = tools.filter((t) => t.name.startsWith("fake__"));
       const cost = promoted.reduce((sum, t) => sum + tokensOf(t), 0);
       expect(promoted.length).toBeGreaterThan(0);
-      // The 400-property fixture alone busts the budget uncompacted, so passing
-      // means eviction actually ran rather than the corpus being too small.
+      // The 400-property fixture alone busts the budget, so passing means
+      // eviction actually ran rather than the corpus being too small.
+      expect(promoted.map((t) => t.name)).not.toContain("fake__bloated_report");
       expect(cost).toBeLessThanOrEqual(3000);
     } finally {
       await cleanup();
@@ -234,8 +355,8 @@ describe("search promotes tools to first-class", () => {
     const { client, cleanup } = await connect("claude-code", "2.1.240");
     try {
       await client.callTool({
-        name: "find_capabilities",
-        arguments: { query: "build a wide analytics report" },
+        name: "call_capability",
+        arguments: { id: "mcp:fake/bloated_report", arguments: {} },
       });
       const tool = (await client.listTools()).tools.find((t) => t.name === "fake__bloated_report");
       expect(tool).toBeDefined();
@@ -255,7 +376,7 @@ describe("slash commands via MCP prompts", () => {
    * prompts is what keeps /mcp__autorouter__<name> working, so adoption is not
    * a silent downgrade.
    */
-  async function withCommand() {
+  async function withCommand(overrides: Record<string, unknown> = {}) {
     const dir = await mkdtemp(join(tmpdir(), "autorouter-prompt-"));
     const skills = join(dir, "skills", "deploy-check");
     await mkdir(skills, { recursive: true });
@@ -271,6 +392,7 @@ describe("slash commands via MCP prompts", () => {
         skillPaths: [join(dir, "skills")],
         selector: { mode: "off" },
         servers: { fake: { command: "bun", args: [FIXTURE] } },
+        ...overrides,
       }),
     );
     const client = new Client({ name: "claude-code", version: "2.1.240" }, { capabilities: {} });
@@ -285,8 +407,28 @@ describe("slash commands via MCP prompts", () => {
     return { client, cleanup: async () => { await client.close(); await rm(dir, { recursive: true, force: true }); } };
   }
 
-  test("publishes skills as prompts and substitutes arguments", async () => {
+  /**
+   * Skills are off the prompt list by default because it is permanent context
+   * and they are the bulk of it — a single plugin shipping 141 of them costs
+   * ~11.5k tokens on every turn. They stay searchable, and a local skill keeps
+   * its native /name, so what "commands" drops is the alias, not the skill.
+   */
+  test("skills are not published as prompts by default, but stay searchable", async () => {
     const { client, cleanup } = await withCommand();
+    try {
+      expect((await client.listPrompts()).prompts.map((p) => p.name)).toEqual(["find"]);
+      const res: any = await client.callTool({
+        name: "find_capabilities",
+        arguments: { query: "verify a deploy is healthy" },
+      });
+      expect(res.content[0].text).toContain("skill:deploy-check");
+    } finally {
+      await cleanup();
+    }
+  }, 30_000);
+
+  test("publishes skills as prompts and substitutes arguments under promptMode: all", async () => {
+    const { client, cleanup } = await withCommand({ promptMode: "all" });
     try {
       const { prompts } = await client.listPrompts();
       const names = prompts.map((p) => p.name);
@@ -325,4 +467,118 @@ describe("slash commands via MCP prompts", () => {
       await cleanup();
     }
   }, 30_000);
+});
+
+describe("adding a server from inside a session", () => {
+  /**
+   * A stdio entry is a command this machine will run on every launch from here
+   * on. Letting one tool call write that is the same mistake as letting one tool
+   * call run a shell command — so the first call reports and writes nothing.
+   */
+  test("add_server refuses to write without confirm", async () => {
+    const { client, cleanup, configPath } = await connectWithConfig("claude-code", "2.1.240");
+    try {
+      const res: any = await client.callTool({
+        name: "add_server",
+        arguments: { name: "second", command: "bun", args: [FIXTURE] },
+      });
+      const text = res.content[0].text as string;
+      expect(text).toContain("Confirmation required");
+      // The resolved command has to be in the message, not just the name — the
+      // whole point is that the user sees what will run.
+      expect(text).toContain(FIXTURE);
+
+      const written = JSON.parse(await readFile(configPath, "utf8"));
+      expect(written.servers.second).toBeUndefined();
+    } finally {
+      await cleanup();
+    }
+  }, 30_000);
+
+  test("add_server registers and the new tools are immediately findable", async () => {
+    const { client, cleanup, configPath } = await connectWithConfig("claude-code", "2.1.240");
+    try {
+      const res: any = await client.callTool({
+        name: "add_server",
+        arguments: { name: "second", command: "bun", args: [FIXTURE, "--second"], confirm: true },
+      });
+      expect(res.isError).toBeFalsy();
+
+      const written = JSON.parse(await readFile(configPath, "utf8"));
+      expect(written.servers.second).toEqual({ command: "bun", args: [FIXTURE, "--second"] });
+
+      const found: any = await client.callTool({
+        name: "find_capabilities",
+        arguments: { query: "restart a container", server: "second" },
+      });
+      expect(found.content[0].text).toContain("mcp:second/restart_container");
+    } finally {
+      await cleanup();
+    }
+  }, 30_000);
+
+  test("add_server rejects an entry that would launch the router again", async () => {
+    const { client, cleanup } = await connectWithConfig("claude-code", "2.1.240");
+    try {
+      const res: any = await client.callTool({
+        name: "add_server",
+        arguments: { name: "loop", command: "npx", args: ["autorouter", "serve"], confirm: true },
+      });
+      expect(res.isError).toBeTruthy();
+      expect(res.content[0].text).toContain("recurse");
+    } finally {
+      await cleanup();
+    }
+  }, 30_000);
+});
+
+describe("auto-adopt inside a running server", () => {
+  /**
+   * The whole point of the flow: `claude mcp add foo` is still the front door,
+   * and the router closes it behind you. A running serve process notices the
+   * harness config changed, moves the entry into its own config, and the server
+   * is searchable — without the user ever running `autorouter adopt`.
+   */
+  test("a server added to the harness is moved behind the router", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "autorouter-auto-"));
+    const configPath = join(dir, "autorouter.json");
+    const claudeConfig = join(dir, ".claude.json");
+    await writeFile(configPath, JSON.stringify({ import: ["claude"], skillPaths: [], selector: { mode: "off" } }));
+    await writeFile(claudeConfig, JSON.stringify({ mcpServers: {} }));
+
+    const client = new Client({ name: "claude-code", version: "2.1.240" }, { capabilities: {} });
+    await client.connect(
+      new StdioClientTransport({
+        command: "bun",
+        args: ["run", CLI, "serve"],
+        env: { ...process.env, AUTOROUTER_CONFIG: configPath, AUTOROUTER_CACHE_DIR: join(dir, "cache"), AUTOROUTER_HOME: dir },
+        stderr: "ignore",
+      }),
+    );
+
+    try {
+      // What `claude mcp add` does, with nothing else involved.
+      await writeFile(
+        claudeConfig,
+        JSON.stringify({ mcpServers: { late: { command: "bun", args: [FIXTURE] } } }),
+      );
+
+      // Two searches: the first observes the config change and triggers the
+      // move, the second sees the rebuilt catalog.
+      await client.callTool({ name: "find_capabilities", arguments: { query: "anything" } });
+      const res: any = await client.callTool({
+        name: "find_capabilities",
+        arguments: { query: "run a database query" },
+      });
+      expect(res.content[0].text).toContain("mcp:late/run_sql_query");
+
+      const harness = JSON.parse(await readFile(claudeConfig, "utf8"));
+      expect(harness.mcpServers).toEqual({});
+      const router = JSON.parse(await readFile(configPath, "utf8"));
+      expect(router.servers.late).toEqual({ command: "bun", args: [FIXTURE] });
+    } finally {
+      await client.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 40_000);
 });

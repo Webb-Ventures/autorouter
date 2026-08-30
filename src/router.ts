@@ -53,16 +53,28 @@ export class Router {
    */
   catalog: Catalog;
   index: HybridIndex;
+  /**
+   * Also mutable, and for a sharper reason than the catalog: a server can be
+   * *added* while this process is running — by `autorouter add`, by adoption
+   * moving one out of a harness, or by the add_server tool. Resolving the config
+   * once at startup would leave the running router indexing and dispatching to
+   * the set of servers that existed when it booted, so a newly added server
+   * would not appear until the host was restarted.
+   */
+  resolved: ResolvedConfig;
+  guard: Guard;
   /** In-flight refresh, so concurrent searches share one rebuild. */
   private refreshing: Promise<void> | null = null;
 
   private constructor(
-    readonly resolved: ResolvedConfig,
+    resolved: ResolvedConfig,
     catalog: Catalog,
     index: HybridIndex,
     readonly pool: ConnectionPool,
-    readonly guard: Guard,
+    guard: Guard,
   ) {
+    this.resolved = resolved;
+    this.guard = guard;
     this.catalog = catalog;
     this.index = index;
   }
@@ -100,17 +112,25 @@ export class Router {
 
     this.refreshing = (async () => {
       try {
-        const catalog = await buildCatalog(this.resolved);
+        // Re-read the config, not just the catalog. The server list is an input
+        // to the build, and the thing that most often changed since the last one
+        // is precisely that list.
+        const resolved = await resolveConfig(this.resolved.cwd);
+        const catalog = await buildCatalog(resolved);
         await saveCatalog(catalog);
-        const index = new HybridIndex(catalog.capabilities, this.resolved.config);
+        const index = new HybridIndex(catalog.capabilities, resolved.config);
         await index.warmEmbeddings();
         // Swap only after the new index is fully built, so no search ever sees
         // a half-populated one.
+        this.resolved = resolved;
+        this.guard = new Guard(resolved.config);
         this.catalog = catalog;
         this.index = index;
         // Servers that failed at the previous build may now be reachable, and
         // a pooled connection created against the old grant would keep failing.
-        this.pool.reset();
+        // The entry list is replaced too, or a server added since startup is
+        // indexed and then fails to dispatch.
+        this.pool.setEntries(resolved.servers);
       } catch {
         // Keep serving what we have. A transient network failure during a
         // background rebuild must not take the router down.

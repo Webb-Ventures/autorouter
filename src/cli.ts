@@ -4,6 +4,7 @@ import { serve } from "./server/index.ts";
 import { runInit, type Harness } from "./cli/init.ts";
 import { runDoctor } from "./cli/doctor.ts";
 import { runAdopt, runRestore } from "./cli/adopt.ts";
+import { runAdd, runRemove } from "./cli/add.ts";
 import { runLogin, summarizeScopes } from "./cli/login.ts";
 import { clearAuth, hasAuth, readAuth } from "./config/oauth.ts";
 import { resolveConfig } from "./config/resolve.ts";
@@ -25,6 +26,10 @@ const USAGE = `autorouter — one search tool instead of every tool
   autorouter login [server]            Authorize an OAuth server (opens a browser);
                                        with no argument, lists what needs one
   autorouter logout <server>           Forget a stored grant
+  autorouter add <name> --url URL      Register a server with the router directly
+  autorouter add <name> -- <cmd> ...   Same, for a stdio server
+  autorouter add --json '<snippet>'    Same, from a pasted mcpServers block
+  autorouter remove <name>             Unregister one
   autorouter init --target <harness>   Register with claude|codex|cursor|vscode
   autorouter adopt --target <harness>  Move that harness's other MCP servers —
                                        and, on Claude Code, its skills and
@@ -35,6 +40,9 @@ const USAGE = `autorouter — one search tool instead of every tool
 
 Options
   --raw          search: skip the selector model, show index ranking
+  --url URL      add: an http server
+  --command C    add: a stdio server (or put the command after a bare --)
+  --json SNIPPET add: a pasted {"mcpServers": {...}} block or a bare entry
   --kind K       restrict to tool|skill|prompt|resource|command|agent
   --server S     restrict to one provider
   --limit N      max results
@@ -54,6 +62,10 @@ Options
   --scopes S     login: request exactly these scopes (comma or space separated)
   --list-scopes  login: show what the server offers, authorize nothing
 
+\`add\` registers behind the router, so a new server never enters your context.
+Servers added to a harness the normal way (\`claude mcp add\`) are moved behind
+it automatically; set "autoAdopt": false to keep that manual.
+
 Servers like Datadog and Supabase hold no credentials in their config — the
 working token is an OAuth grant the harness keeps privately. The router obtains
 its own grant instead of borrowing one, so \`autorouter login <server>\` is a
@@ -61,7 +73,7 @@ one-time step before those can be adopted.
 `;
 
 async function main(argv: string[]): Promise<number> {
-  const { command, positionals, flags } = parseArgs(argv);
+  const { command, positionals, flags, rest } = parseArgs(argv);
 
   switch (command) {
     case undefined:
@@ -103,6 +115,13 @@ async function main(argv: string[]): Promise<number> {
     case "logout":
       return await cmdLogout(positionals[0]);
 
+    case "add":
+      return await cmdAdd(positionals[0], flags, rest);
+
+    case "remove":
+    case "rm":
+      return await cmdRemove(positionals[0]);
+
     case "adopt":
       return await cmdAdopt(flags);
 
@@ -132,6 +151,37 @@ async function main(argv: string[]): Promise<number> {
       console.error(`Unknown command: ${command}\n\n${USAGE}`);
       return 1;
   }
+}
+
+async function cmdAdd(name: string | undefined, flags: Flags, rest: string[]): Promise<number> {
+  try {
+    const result = await runAdd({
+      name,
+      url: flags.url as string | undefined,
+      // Either form of stdio entry: --command "npx -y foo" as one string, or the
+      // argv after a bare --, which is what people copy out of a README.
+      command: (flags.command as string | undefined) ?? rest[0],
+      args: flags.command ? undefined : rest.slice(1),
+      json: flags.json as string | undefined,
+    });
+    console.log(result.message);
+    if (!result.ok && result.path) {
+      console.log("Fix it and re-run, or `autorouter remove` it.");
+    }
+    return result.ok ? 0 : 1;
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    return 1;
+  }
+}
+
+async function cmdRemove(name: string | undefined): Promise<number> {
+  if (!name) {
+    console.error("Usage: autorouter remove <name>");
+    return 1;
+  }
+  console.log(await runRemove(name));
+  return 0;
 }
 
 async function cmdLogin(server: string | undefined, flags: Flags): Promise<number> {
@@ -493,13 +543,26 @@ type Flags = Record<string, string | undefined> & {
   yes?: boolean | any;
 };
 
-function parseArgs(argv: string[]): { command?: string; positionals: string[]; flags: Flags } {
+function parseArgs(argv: string[]): {
+  command?: string;
+  positionals: string[];
+  flags: Flags;
+  rest: string[];
+} {
   const positionals: string[] = [];
   const flags: Flags = {};
   let command: string | undefined;
+  let rest: string[] = [];
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
+    // A bare "--" ends option parsing: everything after it is a command line for
+    // something else, so `autorouter add foo -- npx -y foo-mcp --verbose` passes
+    // that --verbose to foo-mcp rather than swallowing it here.
+    if (arg === "--") {
+      rest = argv.slice(i + 1);
+      break;
+    }
     if (arg.startsWith("--")) {
       const [name, inline] = splitOnce(arg.slice(2), "=");
       // `autorouter --help` must print usage, not fall through to `serve`
@@ -508,10 +571,12 @@ function parseArgs(argv: string[]): { command?: string; positionals: string[]; f
         command = `--${name}`;
         continue;
       }
-      const boolean = [
-        "raw", "json", "yes", "dry-run", "force", "servers-only",
-        "read-only", "list-scopes",
-      ].includes(name);
+      // `--json` is a boolean everywhere else (machine-readable output) but
+      // carries the pasted server snippet for `add`. Resolving that by command
+      // keeps the flag named the way the vendor docs people copy from name it.
+      const boolean =
+        ["raw", "json", "yes", "dry-run", "force", "servers-only", "read-only", "list-scopes"].includes(name) &&
+        !(name === "json" && command === "add");
       if (boolean) {
         flags[name] = true as any;
       } else if (inline !== undefined) {
@@ -524,7 +589,7 @@ function parseArgs(argv: string[]): { command?: string; positionals: string[]; f
     if (!command) command = arg;
     else positionals.push(arg);
   }
-  return { command, positionals, flags };
+  return { command, positionals, flags, rest };
 }
 
 function splitOnce(s: string, sep: string): [string, string | undefined] {

@@ -1,8 +1,9 @@
 import { join } from "node:path";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
-import { ensureDir, exists, readText, writeText } from "../util/fs.ts";
+import { ensureDir, readText, writeText } from "../util/fs.ts";
 import { homeDir, stripJsonComments } from "../util/paths.ts";
 import { resolveConfig } from "../config/resolve.ts";
+import { upsertServers } from "../config/write.ts";
 import type { Harness } from "./init.ts";
 import {
   applyExtras,
@@ -188,7 +189,7 @@ export async function runAdopt(opts: {
     );
   }
 
-  if (movedCount) await mergeIntoRouterConfig(adopted, resolved.configPath);
+  if (movedCount) await upsertServers(adopted, { configPath: resolved.configPath });
   if (extras && extrasCount) await applyExtras(extras);
 
   const notes: string[] = [];
@@ -203,6 +204,41 @@ export async function runAdopt(opts: {
   notes.push(`Backup at ${backupPath}`);
   notes.push("Restart the harness — its tool list should now show only the router.");
   return { plans, extras, backup: backupPath, notes };
+}
+
+/** The harnesses that hold MCP server registrations of their own. */
+const HARNESSES: Harness[] = ["claude", "codex", "cursor", "vscode"];
+
+/**
+ * Keeps the invariant that a harness config holds no downstream servers.
+ *
+ * This is what makes `claude mcp add foo` a complete flow rather than half of
+ * one: the server appears in the harness, the running router notices the config
+ * changed, and the entry is moved behind the router before the next search. It
+ * needs no diffing for "new" servers because adopt is already idempotent — a
+ * second pass finds nothing to move and writes nothing.
+ *
+ * Servers only. Disabling a plugin or hiding a skill is a larger, more opinionated
+ * change to someone's setup than relocating a server entry, and doing it
+ * unprompted is not a trade the user agreed to by installing an MCP server.
+ */
+export async function runAutoAdopt(cwd: string): Promise<string[]> {
+  const resolved = await resolveConfig(cwd);
+  if (resolved.config.autoAdopt === false) return [];
+
+  const notes: string[] = [];
+  for (const harness of HARNESSES) {
+    if (!resolved.config.import.includes(harness)) continue;
+    try {
+      const result = await runAdopt({ harness, cwd, keep: [], dryRun: false, extras: false });
+      const moved = result.plans.flatMap((p) => p.moved);
+      if (moved.length) notes.push(`adopted ${moved.join(", ")} from ${harness}`);
+    } catch {
+      // A harness config that cannot be read or rewritten is not a reason to
+      // fail the search that triggered this.
+    }
+  }
+  return notes;
 }
 
 /** Adoption backups outlive the cache on purpose — losing one loses a config. */
@@ -271,22 +307,4 @@ function serversBehind(patterns: string[]): string[] {
     if (m?.[1]) out.push(m[1]);
   }
   return out;
-}
-
-async function mergeIntoRouterConfig(
-  servers: Record<string, any>,
-  existingPath: string | null,
-): Promise<void> {
-  const path = existingPath ?? join(homeDir(), ".config", "autorouter", "config.json");
-  await ensureDir(join(path, ".."));
-  let config: any = {};
-  if (await exists(path)) {
-    try {
-      config = JSON.parse(stripJsonComments((await readText(path)) ?? "{}"));
-    } catch {
-      config = {};
-    }
-  }
-  config.servers = { ...servers, ...config.servers };
-  await writeText(path, `${JSON.stringify(config, null, 2)}\n`);
 }

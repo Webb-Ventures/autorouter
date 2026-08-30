@@ -12,7 +12,38 @@ export type ResolvedConfig = {
   servers: ServerEntry[];
   configPath: string | null;
   cwd: string;
+  /**
+   * Every file whose contents could change the server list, existing or not.
+   *
+   * The catalog fingerprints these. Without them a server registered by
+   * `claude mcp add` is invisible to a running router until the 6-hour TTL
+   * expires — the router's own config was fingerprinted, but the harness
+   * configs it imports from were not, which is the one place a server is most
+   * likely to appear. Paths are listed whether or not they exist today: a file
+   * that shows up later has to register as a change, and `fingerprint` records
+   * a missing file as "missing" rather than skipping it.
+   */
+  sources: string[];
 };
+
+/** Config files each importer reads, for change detection. */
+function harnessSources(name: string, cwd: string): string[] {
+  const home = homeDir();
+  switch (name) {
+    case "claude":
+      return [join(home, ".claude.json"), join(cwd, ".mcp.json")];
+    case "cursor":
+      return [join(home, ".cursor", "mcp.json"), join(cwd, ".cursor", "mcp.json")];
+    case "vscode":
+      return [join(home, ".vscode", "mcp.json"), join(cwd, ".vscode", "mcp.json")];
+    case "codex":
+      return [join(home, ".codex", "config.toml"), join(cwd, ".codex", "config.toml")];
+    case "plugins":
+      return [join(home, ".claude", "plugins", "installed_plugins.json")];
+    default:
+      return [];
+  }
+}
 
 function configCandidates(cwd: string): string[] {
   const explicit = process.env.AUTOROUTER_CONFIG;
@@ -60,6 +91,7 @@ export async function resolveConfig(cwd = process.cwd()): Promise<ResolvedConfig
   applyEnvOverrides(config);
 
   const imported: ServerEntry[] = [];
+  const sources: string[] = [];
   const loaders: Record<string, () => Promise<ServerEntry[]>> = {
     claude: () => loadClaude(cwd),
     cursor: () => loadCursor(cwd),
@@ -70,6 +102,7 @@ export async function resolveConfig(cwd = process.cwd()): Promise<ResolvedConfig
   for (const name of config.import) {
     const load = loaders[name];
     if (!load) continue;
+    sources.push(...harnessSources(name, cwd));
     try {
       imported.push(...(await load()));
     } catch {
@@ -82,7 +115,7 @@ export async function resolveConfig(cwd = process.cwd()): Promise<ResolvedConfig
     if (entry) imported.push(entry);
   }
 
-  return { config, servers: dedupeServers(imported), configPath, cwd };
+  return { config, servers: dedupeServers(imported), configPath, cwd, sources };
 }
 
 /**
@@ -103,6 +136,14 @@ function applyEnvOverrides(config: RouterConfig): void {
     config.selector.mode = env.AUTOROUTER_SELECTOR_MODE as RouterConfig["selector"]["mode"];
   }
   if (env.AUTOROUTER_SELECTOR_BASE_URL) config.selector.baseUrl = env.AUTOROUTER_SELECTOR_BASE_URL;
+  if (env.AUTOROUTER_PROMPT_MODE) {
+    config.promptMode = env.AUTOROUTER_PROMPT_MODE as RouterConfig["promptMode"];
+  }
+  if (env.AUTOROUTER_ACTIVATION) {
+    config.activation = env.AUTOROUTER_ACTIVATION as RouterConfig["activation"];
+  }
+  if (env.AUTOROUTER_AUTO_ADOPT) config.autoAdopt = env.AUTOROUTER_AUTO_ADOPT !== "0";
+  if (env.AUTOROUTER_ALLOW_ADD_SERVER) config.allowAddServer = env.AUTOROUTER_ALLOW_ADD_SERVER !== "0";
   if (env.AUTOROUTER_EMBEDDINGS_PROVIDER) {
     config.embeddings.provider = env.AUTOROUTER_EMBEDDINGS_PROVIDER as RouterConfig["embeddings"]["provider"];
   }

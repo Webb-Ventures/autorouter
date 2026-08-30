@@ -49,7 +49,18 @@ that keeps `package.json`, `server.json` and `src/cli.ts`'s `VERSION` in sync.
 - **`adopt` edits files people also edit by hand** (`~/.claude.json`,
   `~/.claude/settings.json`, `~/.codex/config.toml`). Every write is backed up
   verbatim to `~/.autorouter/adopted/` first and `restore` must be able to put it
-  back byte for byte. A change that cannot be restored exactly is a bug.
+  back byte for byte. A change that cannot be restored exactly is a bug. This
+  matters more since auto-adopt: those same writes now happen unattended from a
+  running `serve` process, so the backup is the only thing standing between a
+  bug here and someone's config.
+- **Auto-adopt moves servers only.** It never disables a plugin or hides a
+  skill — a server entry is a relocation the user can undo, while turning off a
+  plugin changes what their harness does. Keep `extras: false` on that path.
+- **A running router must see config changes.** `resolveConfig` reports every
+  file it read in `sources`, and the catalog fingerprints all of them, so a
+  server added by any route appears without a restart. `refresh()` re-resolves
+  the config and re-seeds the connection pool for the same reason; indexing a
+  server the pool cannot dispatch to is the failure this prevents.
 - **Refuse rather than silently degrade.** `adopt` leaves a server registered
   when the router cannot reach it, because moving it would delete a working
   capability. Prefer a `skip` line with a reason over a quiet best-effort.

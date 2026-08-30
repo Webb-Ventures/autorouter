@@ -92,7 +92,7 @@ export async function runDoctor(cwd: string): Promise<string> {
   const stillDirect = new Map<Harness, string[]>();
   /** Skills and plugins the harness still loads itself, by harness. */
   const stillLoaded = new Map<Harness, { skills: string[]; plugins: string[] }>();
-  for (const harness of ["claude", "codex", "cursor", "vscode"] as Harness[]) {
+  for (const harness of HARNESSES) {
     try {
       const { plans, extras } = await runAdopt({ harness, cwd, keep: [], dryRun: true, extras: true });
       const names = plans.flatMap((p) => p.moved);
@@ -108,37 +108,54 @@ export async function runDoctor(cwd: string): Promise<string> {
     }
   }
 
-  const directNames = new Set([...stillDirect.values()].flat());
-  const directTokens = catalog.capabilities
-    .filter((c) => c.server && directNames.has(c.server))
-    .reduce((sum, c) => sum + c.approxTokens, 0);
-
-  // Skills cost context even with every server routed: the harness injects each
-  // one's name and description itself. Counting them with the servers is what
-  // makes "still loaded" mean the whole remaining bill rather than part of it.
-  const loadedSkills = new Set([...stillLoaded.values()].flatMap((x) => x.skills));
-  const skillTokens = catalog.capabilities
-    .filter((c) => c.kind === "skill" && loadedSkills.has(c.name))
-    .reduce((sum, c) => sum + c.approxTokens, 0);
+  /** What one harness still loads itself, in tokens. */
+  const unrealized = (harness: Harness): number => {
+    const servers = new Set(stillDirect.get(harness) ?? []);
+    // Skills cost context even with every server routed: the harness injects
+    // each one's name and description itself. Counting them with the servers is
+    // what makes "still loaded" the whole remaining bill rather than part of it.
+    const skills = new Set(stillLoaded.get(harness)?.skills ?? []);
+    return catalog.capabilities
+      .filter(
+        (c) =>
+          (c.server && servers.has(c.server)) || (c.kind === "skill" && skills.has(c.name)),
+      )
+      .reduce((sum, c) => sum + c.approxTokens, 0);
+  };
 
   const full = catalog.capabilities.reduce((sum, c) => sum + c.approxTokens, 0);
-  // The router's own permanent footprint: its five tool definitions, plus the
-  // prompt list, which the host fetches once and carries for the session. The
-  // prompt list is measured rather than assumed, because it scales with how many
-  // skills and commands the catalog holds — quoting a flat number here would
-  // understate the bill on a machine with a large skill library.
-  const routerSurface = 700 + tokensOf(promptList(catalog.capabilities));
+  // The router's own permanent footprint: its tool definitions, plus the prompt
+  // list, which the host fetches once and carries for the session. The prompt
+  // list is measured rather than assumed, because it scales with what the
+  // catalog holds — quoting a flat number here would understate the bill on a
+  // machine with a large skill library.
+  const routerSurface = 700 + tokensOf(promptList(catalog.capabilities, cfg.promptMode));
   lines.push("## Context cost");
   lines.push(`  exposing everything: ~${full.toLocaleString()} tokens`);
-  lines.push(`  router surface:      ~${routerSurface} tokens`);
-  lines.push(`  still loaded direct: ~${(directTokens + skillTokens).toLocaleString()} tokens` +
-    (skillTokens ? ` (${directTokens.toLocaleString()} servers + ${skillTokens.toLocaleString()} skills)` : ""));
-  const saved = full - routerSurface - directTokens - skillTokens;
-  lines.push(
-    saved > 0
-      ? `  actually saved:      ~${saved.toLocaleString()} tokens per request (${Math.round((saved / full) * 100)}%)`
-      : "  actually saved:      nothing yet",
-  );
+  lines.push(`  router surface:      ~${routerSurface.toLocaleString()} tokens`);
+  lines.push(`  best case:           ~${(full - routerSurface).toLocaleString()} tokens saved (${Math.round(((full - routerSurface) / full) * 100)}%)`);
+
+  // Per harness, not summed. A session runs in exactly one harness, so charging
+  // Claude Code for a server that is only still registered in Cursor makes the
+  // headline number describe nobody's actual context.
+  lines.push("", "  per harness (a session only ever runs in one):");
+  for (const harness of HARNESSES) {
+    if (!stillDirect.has(harness) && !stillLoaded.has(harness)) continue;
+    const direct = unrealized(harness);
+    const saved = full - routerSurface - direct;
+    lines.push(
+      `    ${harness.padEnd(7)} still loaded ~${direct.toLocaleString()}` +
+        (saved > 0
+          ? ` → saves ~${saved.toLocaleString()} (${Math.round((saved / full) * 100)}%)`
+          : " → saves nothing yet"),
+    );
+  }
+  const adopted = HARNESSES.filter((h) => !stillDirect.has(h) && !stillLoaded.has(h));
+  if (adopted.length) {
+    lines.push(
+      `    ${adopted.join(", ")}: fully adopted → saves ~${(full - routerSurface).toLocaleString()} (${Math.round(((full - routerSurface) / full) * 100)}%)`,
+    );
+  }
 
   if (stillDirect.size || stillLoaded.size) {
     lines.push("", "## Not yet adopted");
@@ -159,6 +176,8 @@ export async function runDoctor(cwd: string): Promise<string> {
 
   return lines.join("\n");
 }
+
+const HARNESSES: Harness[] = ["claude", "codex", "cursor", "vscode"];
 
 function truncate(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;

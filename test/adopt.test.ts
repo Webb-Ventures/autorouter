@@ -2,7 +2,8 @@ import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { mkdtemp, writeFile, mkdir, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { runAdopt, runRestore } from "../src/cli/adopt.ts";
+import { runAdopt, runRestore, runAutoAdopt } from "../src/cli/adopt.ts";
+import { parseAddSpec, runAdd, runRemove } from "../src/cli/add.ts";
 import { homeDir } from "../src/util/paths.ts";
 
 let dir: string;
@@ -245,4 +246,92 @@ describe("adopt: skills and plugins", () => {
     const res = await runAdopt({ harness: "cursor", cwd: home, keep: [], dryRun: true, extras: true });
     expect(res.extras).toBeNull();
   });
+});
+
+describe("add", () => {
+  test("registers an http server the next resolve returns", async () => {
+    const res = await runAdd({ name: "linear", url: "https://mcp.linear.app/mcp" }, dir);
+    // The fixture URL does not answer, which is the common case for a fresh
+    // OAuth server — the entry must still be saved, or `autorouter login` has
+    // nothing to authorize.
+    expect(res.path).toBeTruthy();
+    const written = JSON.parse(await readFile(process.env.AUTOROUTER_CONFIG!, "utf8"));
+    expect(written.servers.linear).toEqual({ url: "https://mcp.linear.app/mcp" });
+  }, 30_000);
+
+  test("accepts a pasted mcpServers snippet, and a bare entry with a name", async () => {
+    expect(parseAddSpec({ json: '{"mcpServers":{"linear":{"url":"https://x/mcp"}}}' })).toEqual({
+      name: "linear",
+      raw: { url: "https://x/mcp" },
+    });
+    expect(parseAddSpec({ name: "foo", json: '{"command":"npx","args":["foo"]}' })).toEqual({
+      name: "foo",
+      raw: { command: "npx", args: ["foo"] },
+    });
+  });
+
+  test("a multi-server snippet has to say which one", () => {
+    const json = '{"mcpServers":{"a":{"url":"https://a"},"b":{"url":"https://b"}}}';
+    expect(() => parseAddSpec({ json })).toThrow(/2 servers/);
+    expect(parseAddSpec({ name: "b", json }).raw).toEqual({ url: "https://b" });
+  });
+
+  test("refuses to register the router with itself", async () => {
+    const res = await runAdd({ name: "loop", command: "npx", args: ["autorouter", "serve"] }, dir);
+    expect(res.ok).toBe(false);
+    expect(res.message).toContain("recurse");
+    const written = JSON.parse(await readFile(process.env.AUTOROUTER_CONFIG!, "utf8"));
+    expect(written.servers?.loop).toBeUndefined();
+  });
+
+  test("remove reports a name that was never there", async () => {
+    expect(await runRemove("nope", dir)).toContain('No server named "nope"');
+  });
+
+  test("remove warns when a harness will just re-import it", async () => {
+    await writeClaudeConfig(dir);
+    await writeFile(
+      process.env.AUTOROUTER_CONFIG!,
+      JSON.stringify({ import: ["claude"], servers: { railway: { command: "npx", args: ["@railway/mcp"] } } }),
+    );
+    const note = await runRemove("railway", dir);
+    expect(note).toContain("a harness still registers it");
+  });
+});
+
+describe("auto-adopt", () => {
+  test("empties the harness config and is a no-op the second time", async () => {
+    await writeClaudeConfig(dir);
+    await writeFile(process.env.AUTOROUTER_CONFIG!, JSON.stringify({ import: ["claude"] }));
+
+    const first = await runAutoAdopt(dir);
+    expect(first.join(" ")).toContain("adopted");
+    const after = JSON.parse(await readFile(join(home, ".claude.json"), "utf8"));
+    expect(Object.keys(after.mcpServers)).toEqual(["autorouter"]);
+
+    // Idempotence is what makes this safe to run on every staleness check: a
+    // second pass must not rewrite the file or emit a second notification.
+    expect(await runAutoAdopt(dir)).toEqual([]);
+  }, 30_000);
+
+  test("does nothing when switched off", async () => {
+    await writeClaudeConfig(dir);
+    await writeFile(
+      process.env.AUTOROUTER_CONFIG!,
+      JSON.stringify({ import: ["claude"], autoAdopt: false }),
+    );
+    expect(await runAutoAdopt(dir)).toEqual([]);
+    const after = JSON.parse(await readFile(join(home, ".claude.json"), "utf8"));
+    expect(Object.keys(after.mcpServers)).toContain("railway");
+  });
+
+  test("leaves skills and plugins alone", async () => {
+    await writeClaudeConfig(dir);
+    await writeFile(join(home, ".claude"), "", { flag: "a" }).catch(() => {});
+    await writeFile(process.env.AUTOROUTER_CONFIG!, JSON.stringify({ import: ["claude"] }));
+    await runAutoAdopt(dir);
+    // settings.json is where skill and plugin state lives; auto-adopt must not
+    // have created or touched it.
+    await expect(readFile(join(home, ".claude", "settings.json"), "utf8")).rejects.toThrow();
+  }, 30_000);
 });

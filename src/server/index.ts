@@ -13,6 +13,7 @@ import { Router, parseCapabilityId } from "../router.ts";
 import { profileClient, type ClientProfile } from "./clientProfile.ts";
 import { renderCapability, renderRouteResult } from "./render.ts";
 import type { Capability, CapabilityKind } from "../catalog/types.ts";
+import type { RouterConfig } from "../config/types.ts";
 import {
   FIND_PROMPT,
   capabilityForPrompt,
@@ -20,6 +21,8 @@ import {
   promptMessages,
 } from "./prompts.ts";
 import { clamp, compactSchema, tokensOf } from "../util/compact.ts";
+import { runAutoAdopt } from "../cli/adopt.ts";
+import { describeSpec, parseAddSpec, runAdd, type AddSpec } from "../cli/add.ts";
 
 const NAME = "autorouter";
 const VERSION = "0.1.0";
@@ -27,20 +30,16 @@ const VERSION = "0.1.0";
 const INSTRUCTIONS = `This server is a capability router. Instead of loading every
 available tool into your context, it exposes a search interface over all of them.
 
-Workflow:
-1. find_capabilities({ query }) — describe what you are trying to do in plain
-   language. Matching tools come back with their full input schema, and on
-   hosts that support it are added to your tool list immediately, so you can
-   call them directly like any other tool.
-2. call_capability({ id, arguments }) — the fallback path, and the only one on
-   hosts that do not refresh their tool list. Use it whenever a tool named in a
-   search result is not yet callable directly; the result is identical.
-3. describe_capability({ id }) — full detail on demand: the schema for a tool
-   that was not inlined, or the complete instruction text for a skill. Reading a
-   skill's instructions is how a skill runs.
+1. find_capabilities({ query }) — say what you are trying to do, in plain
+   language. Top tool hits come back with their input schema attached.
+2. call_capability({ id, arguments }) — run any hit by its id. A tool you call
+   more than once is promoted into your tool list automatically.
+3. describe_capability({ id }) — the full schema for a hit whose schema was
+   abbreviated, or a skill's instruction text. Reading those instructions is how
+   a skill runs.
 
-Search before concluding that something is impossible: the catalog covers many
-servers, skills and plugin commands that are not visible in your tool list.`;
+Search before concluding something is impossible: the catalog is much larger
+than your tool list.`;
 
 export async function serve(opts: { cwd?: string } = {}): Promise<void> {
   const router = await Router.create({ cwd: opts.cwd });
@@ -61,6 +60,35 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
   let profile: ClientProfile | null = null;
   /** Capabilities promoted to real tools, keyed by their exposed tool name. */
   const activated = new Map<string, Capability>();
+  const { promptMode, activation, allowAddServer } = router.resolved.config;
+  /**
+   * Adoptions that have happened since the last search, waiting to be reported.
+   *
+   * Auto-adopt fires from a background refresh, where the only channel is
+   * stderr — which nobody is tailing. The user needs to know two things (a
+   * server moved, and the harness must restart before its context is actually
+   * reclaimed), so the note rides out on the next search result and is then
+   * cleared.
+   */
+  let pendingNotes: string[] = [];
+  /** Promotion needs both a host that refreshes its tool list and a mode that wants it. */
+  const canPromote = () => Boolean(profile?.supportsListChanged) && activation !== "off";
+
+  /**
+   * Promotes a tool the model just used successfully.
+   *
+   * This is the whole of "lazy": a tool definition is permanent context for the
+   * rest of the session, and a search hit is only evidence that the model looked
+   * at something. A completed call is evidence it needs it — and a second call
+   * then goes through the host's own validation and permission prompt rather
+   * than the proxy.
+   */
+  const promoteOnUse = async (cap: Capability): Promise<string | null> => {
+    if (activation !== "lazy" || !canPromote()) return null;
+    if (cap.kind !== "tool" || !cap.inputSchema) return null;
+    const [name] = await promote(server, activated, [cap]);
+    return name ?? null;
+  };
 
   server.oninitialized = () => {
     profile = profileClient(server.getClientVersion(), server.getClientCapabilities());
@@ -73,20 +101,20 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
     // startup forever — including one built before a server was authorized,
     // where the fix (login + reindex) lands on disk and never reaches here.
     void refreshAndAnnounce();
-    const tools = routerTools(router, profile);
+    const tools = routerTools(router, profile, activation, allowAddServer);
     for (const [name, cap] of activated) tools.push(promotedTool(name, cap));
     return { tools };
   });
 
   server.setRequestHandler(ListPromptsRequestSchema, async () => {
     void refreshAndAnnounce();
-    return { prompts: promptList(router.catalog.capabilities) };
+    return { prompts: promptList(router.catalog.capabilities, promptMode) };
   });
 
   server.setRequestHandler(GetPromptRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
     if (await router.isStale()) await router.refresh();
-    return await handleGetPrompt(router, name, args as Record<string, string>);
+    return await handleGetPrompt(router, name, args as Record<string, string>, promptMode);
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -96,19 +124,27 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
         case "find_capabilities":
           // A search is the request where a missing capability actually hurts,
           // so wait for a pending rebuild rather than answering from a catalog
-          // we already know is stale.
-          if (await router.isStale()) await router.refresh();
-          return await handleFind(router, server, profile, activated, args as any);
+          // we already know is stale. Going through refreshAndAnnounce rather
+          // than refresh() is what lets a server added since startup be adopted
+          // and found in the same request — a host that never re-lists its tools
+          // would otherwise never trigger the check at all.
+          if (await router.isStale()) await refreshAndAnnounce();
+          return await handleFind(router, server, profile, activated, activation, args as any, drainNotes());
         case "describe_capability":
           return await handleDescribe(router, args as any);
         case "call_capability":
-          return await handleCall(router, args as any);
+          return await handleCall(router, promoteOnUse, args as any);
         case "activate_capabilities":
           return await handleActivate(router, server, activated, args as any);
         case "deactivate_capabilities":
           return await handleDeactivate(server, activated, args as any);
+        case "add_server":
+          return await handleAddServer(router, server, args as any);
         default: {
           const cap = activated.get(name);
+          // Already a first-class tool: the host validated the arguments and
+          // named it in its own permission prompt, so there is nothing to
+          // promote and no proxy disclaimer to add.
           if (cap) return await invoke(router, cap, args, true);
           return errorResult(`Unknown tool: ${name}. Use find_capabilities to search.`);
         }
@@ -126,15 +162,54 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
    * descriptions would keep showing a list that omits a newly authorized
    * server.
    */
+  let adopting = false;
+  /**
+   * Runs only after a refresh that was actually triggered by a changed config.
+   *
+   * Auto-adopt reads and rewrites harness config files; doing that on every
+   * tools/list would be a lot of filesystem work to discover nothing, since the
+   * answer only changes when one of those files does — which is exactly what
+   * staleness already tracks.
+   */
+  async function maybeAutoAdopt(): Promise<void> {
+    // Adoption rewrites the harness config, which changes the fingerprint that
+    // triggered this refresh. That is not a loop — adopt is idempotent, so the
+    // next pass finds nothing to move — but the flag keeps two concurrent
+    // requests from both trying to rewrite the same file.
+    if (adopting) return;
+    adopting = true;
+    try {
+      const adopted = await runAutoAdopt(router.resolved.cwd);
+      for (const note of adopted) {
+        log(note);
+        pendingNotes.push(`${note} — restart the harness to reclaim its context.`);
+      }
+      if (adopted.length) await router.refresh({ force: true });
+    } catch {
+      // Never fail the request that happened to trigger the check.
+    } finally {
+      adopting = false;
+    }
+  }
+
   async function refreshAndAnnounce(): Promise<void> {
     const before = router.summary();
+    const wasStale = await router.isStale();
     await router.refresh();
+    if (wasStale) await maybeAutoAdopt();
+
     if (router.summary() === before) return;
     log(`catalog changed — ${router.summary()}`);
     server.sendToolListChanged?.();
     // A newly authorized server can contribute skills and commands too, so the
     // slash-command list goes stale alongside the tool list.
     server.sendPromptListChanged?.();
+  }
+
+  function drainNotes(): string[] {
+    const notes = pendingNotes;
+    pendingNotes = [];
+    return notes;
   }
 
   const transport = new StdioServerTransport();
@@ -162,7 +237,12 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
   });
 }
 
-function routerTools(router: Router, profile: ClientProfile | null): Tool[] {
+function routerTools(
+  router: Router,
+  profile: ClientProfile | null,
+  activation: RouterConfig["activation"],
+  allowAddServer: boolean,
+): Tool[] {
   const tools: Tool[] = [
     {
       name: "find_capabilities",
@@ -217,8 +297,9 @@ function routerTools(router: Router, profile: ClientProfile | null): Tool[] {
 
   // Only advertise dynamic exposure where the client will actually honour the
   // list_changed notification — otherwise the model activates tools that never
-  // materialize and has no way to recover.
-  if (profile?.supportsListChanged) {
+  // materialize and has no way to recover. Under "off" the pair is dead weight
+  // in every request, so it does not ship at all.
+  if (profile?.supportsListChanged && activation !== "off") {
     tools.push(
       {
         name: "activate_capabilities",
@@ -245,7 +326,74 @@ function routerTools(router: Router, profile: ClientProfile | null): Tool[] {
     );
   }
 
+  if (allowAddServer) {
+    tools.push({
+      name: "add_server",
+      description:
+        "Register a new MCP server behind the router, instead of running `claude mcp add`. Pass url or command+args, or json for a pasted {\"mcpServers\":{…}} snippet. Rejected without confirm: true.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          url: { type: "string" },
+          command: { type: "string" },
+          args: { type: "array", items: { type: "string" } },
+          env: { type: "object" },
+          headers: { type: "object" },
+          json: { type: "string" },
+          confirm: { type: "boolean" },
+        },
+        required: ["name"],
+      },
+    });
+  }
+
   return tools;
+}
+
+/**
+ * Registers a server on the model's behalf.
+ *
+ * Gated the same way `confirm` capabilities are: the first call reports what
+ * would be registered and writes nothing. A stdio entry is a command this
+ * machine will execute on every subsequent launch, so it must not land on one
+ * tool call that the user waved through — the resolved command has to be in
+ * front of them before anything is written.
+ */
+async function handleAddServer(
+  router: Router,
+  server: Server,
+  args: AddSpec & { confirm?: boolean },
+): Promise<CallToolResult> {
+  let target: string;
+  let name: string;
+  try {
+    const parsed = parseAddSpec(args);
+    name = parsed.name;
+    target = describeSpec(parsed.raw);
+  } catch (err) {
+    return errorResult(err instanceof Error ? err.message : String(err));
+  }
+
+  if (args.confirm !== true) {
+    return textResult(
+      [
+        `Confirmation required before registering "${name}".`,
+        `This machine will ${args.url || target.startsWith("http") ? "connect to" : "execute"}: ${target}`,
+        "",
+        "Show the user that line. If it is what they asked for, call add_server again with confirm: true.",
+      ].join("\n"),
+    );
+  }
+
+  const result = await runAdd(args, router.resolved.cwd);
+  if (!result.ok) return errorResult(result.message);
+
+  // The catalog just grew; the host is holding a stale tool and prompt list.
+  await router.refresh({ force: true });
+  server.sendToolListChanged?.();
+  server.sendPromptListChanged?.();
+  return textResult(`${result.message}\nSearch for them with find_capabilities.`);
 }
 
 /**
@@ -286,6 +434,7 @@ async function handleGetPrompt(
   router: Router,
   name: string,
   args: Record<string, string>,
+  mode: RouterConfig["promptMode"],
 ): Promise<GetPromptResult> {
   if (name === FIND_PROMPT) {
     const query = (args.query ?? "").trim();
@@ -305,7 +454,7 @@ async function handleGetPrompt(
     };
   }
 
-  const cap = capabilityForPrompt(router.catalog.capabilities, name);
+  const cap = capabilityForPrompt(router.catalog.capabilities, name, mode);
   if (!cap) throw new Error(`Unknown prompt: ${name}`);
   const found = await router.describe(cap.id);
   return {
@@ -338,7 +487,9 @@ async function handleFind(
   server: Server,
   profile: ClientProfile | null,
   activated: Map<string, Capability>,
+  activation: RouterConfig["activation"],
   args: { query?: string; kind?: CapabilityKind; server?: string; limit?: number },
+  notes: string[] = [],
 ): Promise<CallToolResult> {
   const query = (args.query ?? "").trim();
   if (!query) return errorResult("query is required");
@@ -351,20 +502,23 @@ async function handleFind(
     server_handle: server,
   });
 
-  // Where the host honours list_changed, promote the matched tools instead of
-  // describing them. That is the difference between approximating a native tool
-  // call and making one: the host validates the arguments against the real
-  // schema, the permission prompt names the real tool rather than
-  // "call_capability", and the router leaves the execution path entirely. The
-  // proxy stays as the fallback, because Claude Code does not always allow a
-  // tool registered mid-turn to be called before the next one.
-  const promoted = profile?.supportsListChanged
+  // Under "eager", promote the matched tools instead of describing them: the
+  // host then validates arguments against the real schema and its permission
+  // prompt names the real tool rather than "call_capability".
+  //
+  // It is not the default because the bill lands in the wrong place. A promoted
+  // tool is permanent context for the session, and a search hit only means the
+  // model looked — most of five promoted tools per search are never called. The
+  // inline schema below costs a fraction, once, in the transcript; promotion is
+  // deferred to the first successful call, where the need is proven.
+  const promoted = activation === "eager" && profile?.supportsListChanged
     ? await promote(server, activated, result.hits.map((h) => h.capability))
     : [];
 
   // Inlining schemas here as well would pay for them twice — the host is about
   // to list these tools with their schemas already attached.
-  const text = renderRouteResult(query, result, { inlineSchemas: promoted.length === 0 });
+  const body = renderRouteResult(query, result, { inlineSchemas: promoted.length === 0 });
+  const text = notes.length ? `${notes.map((n) => `[autorouter] ${n}`).join("\n")}\n\n${body}` : body;
   if (!promoted.length) return textResult(text);
 
   return textResult(
@@ -439,12 +593,30 @@ async function handleDescribe(router: Router, args: { id?: string }): Promise<Ca
 
 async function handleCall(
   router: Router,
+  promoteOnUse: (cap: Capability) => Promise<string | null>,
   args: { id?: string; arguments?: unknown; confirm?: boolean },
 ): Promise<CallToolResult> {
   if (!args.id) return errorResult("id is required");
   const cap = router.get(args.id);
   if (!cap) return errorResult(`No capability with id "${args.id}".`);
-  return invoke(router, cap, args.arguments ?? {}, args.confirm === true);
+  const out = await invoke(router, cap, args.arguments ?? {}, args.confirm === true);
+
+  // Only a call that worked earns a place in the tool list. A failed one is as
+  // likely to mean the model picked the wrong capability as that it needs this
+  // one again, and the budget it would occupy is permanent either way.
+  if (out.isError) return out;
+  const name = await promoteOnUse(cap);
+  if (!name) return out;
+  return {
+    ...out,
+    content: [
+      ...out.content,
+      {
+        type: "text" as const,
+        text: `(now in your tool list as ${name} — call it directly next time)`,
+      },
+    ],
+  };
 }
 
 async function invoke(

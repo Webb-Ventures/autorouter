@@ -44,6 +44,11 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {} },
   },
   {
+    name: "explode",
+    description: "Always fails. Exists so a test can observe what the router does with a failed call.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
     name: "bloated_report",
     description: "Build a wide analytics report. Deliberately enormous, to exercise the router's token budget.",
     // Structure, not prose: compaction trims descriptions but must never drop a
@@ -91,6 +96,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => ({
   content: [
     { type: "text", text: `called ${req.params.name} with ${JSON.stringify(req.params.arguments ?? {})}` },
   ],
+  ...(req.params.name === "explode" ? { isError: true } : {}),
 }));
 
 await server.connect(new StdioServerTransport());

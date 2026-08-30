@@ -123,12 +123,22 @@ async function writePrimer(harness: Harness): Promise<string> {
   await ensureDir(join(path, ".."));
 
   const current = (await readText(path)) ?? "";
-  if (current.includes("<!-- autorouter -->")) return `Primer already present in ${path}`;
-
   const section =
     harness === "cursor"
       ? `---\ndescription: Capability router\nalwaysApply: true\n---\n\n${PRIMER}`
       : PRIMER;
+
+  // Rewrite an existing block rather than skipping it. Returning early on the
+  // marker means every machine that ran an older `init` keeps guidance that has
+  // since gone stale — and the primer is the only thing telling the model the
+  // router exists at all, so a stale one is a silent regression.
+  const existing = /<!-- autorouter -->[\s\S]*?<!-- \/autorouter -->/.exec(current);
+  if (existing) {
+    if (existing[0] === PRIMER) return `Primer already current in ${path}`;
+    await writeText(path, current.replace(existing[0], PRIMER));
+    return `Updated router primer in ${path}`;
+  }
+
   await writeText(path, current ? `${current.trimEnd()}\n\n${section}\n` : `${section}\n`);
   return `Added router primer to ${path}`;
 }
@@ -143,6 +153,11 @@ Before deciding a task cannot be done, or reaching for a manual workaround, call
 \`find_capabilities({ query: "<what you are trying to do>" })\`. It searches every
 configured MCP server, skill and plugin command and returns only what fits.
 Then \`describe_capability\` for the schema, and \`call_capability\` to run it.
+
+To install a new MCP server, use the router's \`add_server\` tool, or run
+\`autorouter add <name> --url <url>\` / \`autorouter add <name> -- <command>\`.
+Do not run \`claude mcp add\` — that loads the server's whole tool list into
+context, which is what the router is here to avoid.
 <!-- /autorouter -->`;
 
 async function promptModel(harness: Harness, suggested: string | null): Promise<string | null> {

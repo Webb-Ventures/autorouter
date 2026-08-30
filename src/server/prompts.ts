@@ -1,16 +1,20 @@
 import type { Prompt, PromptMessage } from "@modelcontextprotocol/sdk/types.js";
 import type { Capability } from "../catalog/types.ts";
+import type { RouterConfig } from "../config/types.ts";
 import { clamp } from "../util/compact.ts";
+
+export type PromptMode = RouterConfig["promptMode"];
 
 /**
  * Slash commands, via MCP prompts.
  *
  * Claude Code will not accept slash commands over MCP — it reads `commands/*.md`
  * off disk, which a router cannot contribute to. What it *does* surface as slash
- * commands are MCP prompts, as `/mcp__autorouter__<name>`. So every instruction-
- * style capability in the catalog (skills, plugin commands, subagents) is
- * published as a prompt, and adopting a plugin into the router keeps its slash
- * commands working instead of silently dropping them.
+ * commands are MCP prompts, as `/mcp__autorouter__<name>`. Publishing an
+ * instruction-style capability here is what keeps its slash command working
+ * after adoption, instead of silently dropping it. Which ones get published is
+ * `promptMode` — see KINDS_BY_MODE, and note that the list is permanent context
+ * for the session, so this is not a free "publish everything" decision.
  *
  * Tools are deliberately absent. A prompt returns text for the model to act on;
  * it cannot return a tool result, so exposing `execute_sql` here would produce a
@@ -18,6 +22,22 @@ import { clamp } from "../util/compact.ts";
  * through search and activation instead.
  */
 export const INSTRUCTION_KINDS = new Set(["skill", "command", "agent"]);
+
+/**
+ * Which kinds each mode publishes.
+ *
+ * Skills are excluded by default because publishing them is close to pure
+ * duplication: `adopt --skill-mode user-invocable-only` leaves a local skill's
+ * native `/name` working, and a plugin's skills are surfaced by the harness on
+ * demand rather than injected. What is left is the set the harness genuinely
+ * cannot offer once adopted — plugin commands and subagents — which is a
+ * handful of prompts instead of a hundred and fifty.
+ */
+const KINDS_BY_MODE: Record<PromptMode, Set<string>> = {
+  all: INSTRUCTION_KINDS,
+  commands: new Set(["command", "agent"]),
+  none: new Set<string>(),
+};
 
 /** The search entry point, so `/mcp__autorouter__find <query>` works. */
 export const FIND_PROMPT = "find";
@@ -33,9 +53,31 @@ export const FIND_PROMPT = "find";
  * this machine's catalog, clamping here roughly halves the permanent cost of the
  * prompt list at no cost to selection.
  */
-const DESCRIPTION_CHARS = 180;
+const DESCRIPTION_CHARS = 120;
 
-export function promptList(capabilities: Capability[]): Prompt[] {
+/**
+ * The published set, as (name, capability) pairs.
+ *
+ * Both the list and the reverse lookup are derived from this one walk. Deriving
+ * them separately is how a name silently resolves to the wrong capability once
+ * the filter or the collision suffix changes on one side only.
+ */
+function* published(
+  capabilities: Capability[],
+  mode: PromptMode,
+): Generator<[string, Capability]> {
+  const kinds = KINDS_BY_MODE[mode] ?? KINDS_BY_MODE.commands;
+  if (!kinds.size) return;
+  const seen = new Set<string>([FIND_PROMPT]);
+  for (const cap of capabilities) {
+    if (!kinds.has(cap.kind)) continue;
+    const name = uniquePromptName(cap, seen);
+    seen.add(name);
+    yield [name, cap];
+  }
+}
+
+export function promptList(capabilities: Capability[], mode: PromptMode = "commands"): Prompt[] {
   const prompts: Prompt[] = [
     {
       name: FIND_PROMPT,
@@ -44,11 +86,7 @@ export function promptList(capabilities: Capability[]): Prompt[] {
     },
   ];
 
-  const seen = new Set<string>([FIND_PROMPT]);
-  for (const cap of capabilities) {
-    if (!INSTRUCTION_KINDS.has(cap.kind)) continue;
-    const name = uniquePromptName(cap, seen);
-    seen.add(name);
+  for (const [name, cap] of published(capabilities, mode)) {
     prompts.push({
       name,
       description: clamp(cap.description || `${cap.kind} ${cap.name}`, DESCRIPTION_CHARS),
@@ -92,12 +130,9 @@ function uniquePromptName(cap: Capability, taken: Set<string>): string {
 export function capabilityForPrompt(
   capabilities: Capability[],
   name: string,
+  mode: PromptMode = "commands",
 ): Capability | undefined {
-  const seen = new Set<string>([FIND_PROMPT]);
-  for (const cap of capabilities) {
-    if (!INSTRUCTION_KINDS.has(cap.kind)) continue;
-    const promptName = uniquePromptName(cap, seen);
-    seen.add(promptName);
+  for (const [promptName, cap] of published(capabilities, mode)) {
     if (promptName === name) return cap;
   }
   return undefined;

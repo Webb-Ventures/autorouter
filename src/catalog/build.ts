@@ -19,7 +19,10 @@ export async function buildCatalog(resolved: ResolvedConfig): Promise<Catalog> {
   const { config, servers, cwd, configPath } = resolved;
   const capabilities: Capability[] = [];
   const errors: Record<string, string> = {};
-  const sourceFiles: string[] = configPath ? [configPath] : [];
+  // The router's own config, plus every harness config it imports from — a
+  // server appearing in one of those is the most common way this catalog goes
+  // out of date.
+  const sourceFiles: string[] = [...(configPath ? [configPath] : []), ...resolved.sources];
 
   // A grant is a real input to the catalog: an unauthorized server contributes
   // zero capabilities, so obtaining a token changes the result as surely as

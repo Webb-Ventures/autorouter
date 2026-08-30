@@ -24,6 +24,20 @@ export class ConnectionPool {
     return [...this.byName.keys()];
   }
 
+  /**
+   * Replaces the known servers, dropping every live connection.
+   *
+   * Called on refresh, because the set of servers is not fixed for the life of
+   * the process — one can be added while it runs. Closing the old clients is
+   * the point rather than a side effect: an entry may have been edited in place
+   * (a new URL, a new env block), and a pooled connection to the old target
+   * would keep answering as if nothing changed.
+   */
+  setEntries(entries: ServerEntry[]): void {
+    this.reset();
+    this.byName = new Map(entries.map((e) => [e.name, e]));
+  }
+
   async get(serverName: string): Promise<Client> {
     const existing = this.clients.get(serverName);
     if (existing) {
