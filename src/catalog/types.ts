@@ -36,7 +36,21 @@ export type Catalog = {
   errors: Record<string, string>;
 };
 
-export const CATALOG_VERSION = 4;
+/**
+ * Bump this whenever a bug could have persisted a *wrong* catalog.
+ *
+ * A cached catalog records the fingerprints of its own inputs, so one built
+ * from a stale server list is indistinguishable from a correct one: it is not
+ * stale, and every later process loads it and has no reason to rebuild. That is
+ * not self-healing — it survives restarts and outlives the process that caused
+ * it. Bumping the version is the only lever that reaches an already-written
+ * cache, because `loadCatalog` discards a mismatched one outright.
+ *
+ * 5: `refresh()` used to rebuild from the config resolved at startup, so any
+ *    server registered while a `serve` process was running was written out of
+ *    the catalog and then cached as current.
+ */
+export const CATALOG_VERSION = 5;
 
 /** ~4 chars/token is close enough for a budget estimate. */
 export function estimateTokens(...parts: Array<string | unknown>): number {
