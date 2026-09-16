@@ -6,6 +6,7 @@ import { runDoctor } from "./cli/doctor.ts";
 import { runAdopt, runRestore } from "./cli/adopt.ts";
 import { runAdd, runRemove } from "./cli/add.ts";
 import { runLogin, summarizeScopes } from "./cli/login.ts";
+import { runUpdate } from "./cli/update.ts";
 import { clearAuth, hasAuth, readAuth } from "./config/oauth.ts";
 import { resolveConfig } from "./config/resolve.ts";
 import { renderCapability, renderRouteResult, oneLine } from "./server/render.ts";
@@ -23,6 +24,9 @@ const USAGE = `autorouter — one search tool instead of every tool
   autorouter list [--kind K]           List everything in the catalog
   autorouter reindex                   Rebuild the catalog now
   autorouter doctor                    Show what is reachable and what it saves
+  autorouter update                    Upgrade via the package manager that
+                                       installed this copy. --check to look
+                                       without installing.
   autorouter login [server]            Authorize an OAuth server (opens a browser,
                                        or prints a code on a headless box);
                                        with no argument, lists what needs one
@@ -50,6 +54,8 @@ Options
   --json         machine-readable output
   --yes          init/adopt: do not prompt
   --dry-run      adopt: show what would move, change nothing
+                 update: print the upgrade command without running it
+  --check        update: report the available version, install nothing
   --force        adopt: proceed even if a server is unreachable
   --keep S       adopt: leave server S registered in the harness (comma-separated)
   --keep-skill S adopt: leave skill S loaded (comma-separated)
@@ -112,6 +118,18 @@ async function main(argv: string[]): Promise<number> {
     case "doctor":
       console.log(await runDoctor(process.cwd()));
       return 0;
+
+    case "update":
+    case "upgrade": {
+      const result = await runUpdate({
+        current: VERSION,
+        check: Boolean(flags.check),
+        dryRun: Boolean(flags["dry-run"]),
+        force: Boolean(flags.force),
+      });
+      console.log(result.message);
+      return result.ok ? 0 : 1;
+    }
 
     case "init":
       return await cmdInit(flags);
@@ -586,7 +604,7 @@ function parseArgs(argv: string[]): {
       // carries the pasted server snippet for `add`. Resolving that by command
       // keeps the flag named the way the vendor docs people copy from name it.
       const boolean =
-        ["raw", "json", "yes", "dry-run", "force", "servers-only", "read-only", "all-scopes", "list-scopes", "device", "manual"].includes(name) &&
+        ["raw", "json", "yes", "dry-run", "force", "servers-only", "read-only", "all-scopes", "list-scopes", "device", "manual", "check"].includes(name) &&
         !(name === "json" && command === "add");
       if (boolean) {
         flags[name] = true as any;

@@ -364,11 +364,39 @@ autorouter adopt --target claude --servers-only     # skip skills and plugins
 autorouter adopt --target claude --keep project-tools --keep-plugin ui-toolkit
 autorouter restore --target claude                  # undo the most recent adopt
 
+autorouter update                                   # upgrade in place
+autorouter update --check                           # is there a newer version?
+
 autorouter login                                    # which servers need a grant
 autorouter login remote-server                      # authorize one (opens a browser)
 autorouter login remote-server --device             # headless: enter a code elsewhere
 autorouter logout remote-server                     # forget a stored grant
 ```
+
+## Updating
+
+`autorouter update` upgrades in place, using the package manager that installed
+the copy you are running:
+
+```sh
+autorouter update            # detect, then upgrade
+autorouter update --check    # report the available version, install nothing
+autorouter update --dry-run  # print the command, do not run it
+```
+
+Which manager to use is decided by where the running file sits on disk, not by
+what happens to be on `PATH` — running `npm i -g` against a pnpm-managed global
+installs a second copy that shadows the first, and you would then be upgrading
+one install while running the other.
+
+Three cases do not run a package manager, and say so instead: a copy unpacked by
+`npx`/`bunx`/`pnpm dlx` (nothing to upgrade — those refetch every run), a git
+checkout (`git pull && bun install && bun run build`), and a layout it cannot
+identify. All three still report whether a newer version exists.
+
+The router is a long-lived stdio server, so a harness that already has it
+running keeps the old build until it respawns it — restart the harness, or
+reconnect the MCP server, after updating.
 
 ## OAuth servers
 

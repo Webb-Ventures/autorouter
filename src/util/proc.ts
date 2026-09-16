@@ -70,6 +70,34 @@ export function run(
 }
 
 /**
+ * Run a command with its output going straight to the terminal.
+ *
+ * The opposite trade from run(): nothing is captured, so the caller learns only
+ * the exit code, but the user watches it happen. That is the right way round
+ * for a package-manager install, which can take a minute and prints progress
+ * the whole time — buffering it would look like a hang and then dump the log
+ * after it no longer matters.
+ */
+export function runStreaming(
+  command: string,
+  args: string[],
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<number | null> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: "inherit",
+      cwd: opts.cwd,
+      env: opts.env,
+      // Package managers on Windows are .cmd shims, which spawn cannot execute
+      // without a shell.
+      shell: process.platform === "win32",
+    });
+    child.on("error", reject);
+    child.on("close", (code) => resolve(code));
+  });
+}
+
+/**
  * Whether a command exists on PATH, without paying to start it.
  *
  * Node has no built-in equivalent of Bun.which, and shelling out to `which`

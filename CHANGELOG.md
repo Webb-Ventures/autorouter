@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `autorouter update`: upgrade in place via the package manager that installed
+  the running copy, detected from where that copy sits on disk rather than from
+  `PATH` — npm/pnpm/yarn/bun, global or as a project dependency. `--check`
+  reports the available version without installing and `--dry-run` prints the
+  command. An `npx`/`bunx`/`dlx` copy and a source checkout are reported as
+  such instead of having a package manager run against them.
 - Headless login. `autorouter login --device` runs the RFC 8628 device
   authorization grant — it prints a short code and a URL to enter on any other
   device and polls for the result, so nothing has to reach back into the
