@@ -59,6 +59,8 @@ Options
   --client-id ID login: use a pre-registered OAuth client (servers without RFC 7591)
   --client-secret S  login: its secret, if it is a confidential client
   --read-only    login: request only the scopes that cannot mutate anything
+  --all-scopes   login: request everything the server advertises, dropping
+                 any narrowing the previous grant carried
   --scopes S     login: request exactly these scopes (comma or space separated)
   --list-scopes  login: show what the server offers, authorize nothing
 
@@ -207,7 +209,7 @@ async function cmdLogin(server: string | undefined, flags: Flags): Promise<numbe
         };
       }),
     );
-    console.log("Usage: autorouter login <server> [--read-only | --scopes a,b]\n");
+    console.log("Usage: autorouter login <server> [--read-only | --all-scopes | --scopes a,b]\n");
     for (const s of states) {
       const scope = s.ok && s.scope ? `  ${summarizeScopes(s.scope)}` : "";
       console.log(`  ${s.ok ? "ok  " : "-   "} ${s.name}${scope}`);
@@ -236,6 +238,7 @@ async function cmdLogin(server: string | undefined, flags: Flags): Promise<numbe
     clientSecret: flags["client-secret"] as string | undefined,
     scopes: flags.scopes as string | undefined,
     readOnly: Boolean(flags["read-only"]),
+    allScopes: Boolean(flags["all-scopes"]),
     listScopes: Boolean(flags["list-scopes"]),
   });
   console.log(result.message);
@@ -575,7 +578,7 @@ function parseArgs(argv: string[]): {
       // carries the pasted server snippet for `add`. Resolving that by command
       // keeps the flag named the way the vendor docs people copy from name it.
       const boolean =
-        ["raw", "json", "yes", "dry-run", "force", "servers-only", "read-only", "list-scopes"].includes(name) &&
+        ["raw", "json", "yes", "dry-run", "force", "servers-only", "read-only", "all-scopes", "list-scopes"].includes(name) &&
         !(name === "json" && command === "add");
       if (boolean) {
         flags[name] = true as any;

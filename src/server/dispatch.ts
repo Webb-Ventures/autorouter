@@ -4,6 +4,17 @@ import { connect, withTimeout } from "../catalog/providers/mcp.ts";
 import { authHint } from "../config/oauth.ts";
 
 /**
+ * Replaces an error with its actionable form, keeping the original when
+ * authHint() had nothing to add — an unrelated failure should not be reworded
+ * into something that looks like an auth problem.
+ */
+function hinted(server: string, err: unknown): Error {
+  const raw = err instanceof Error ? err.message : String(err);
+  const hint = authHint(server, err);
+  return hint === raw ? (err instanceof Error ? err : new Error(raw)) : new Error(hint);
+}
+
+/**
  * Lazily-opened, reused connections to downstream servers. Nothing is spawned
  * until a capability from that server is actually called, which is what makes
  * the router cheap: 20 configured servers cost zero processes at rest.
@@ -64,30 +75,45 @@ export class ConnectionPool {
       this.clients.delete(serverName);
       // A grant can expire between a reindex and a call, so the actionable
       // message has to exist on this path too, not just at index time.
-      const hint = authHint(serverName, err);
-      throw hint === (err instanceof Error ? err.message : String(err)) ? err : new Error(hint);
+      throw hinted(serverName, err);
+    }
+  }
+
+  /**
+   * Runs a request against a pooled client, rewriting auth failures.
+   *
+   * Connecting is not the only place a grant can turn out to be wrong. A
+   * too-narrow one connects and lists perfectly well and only fails on the one
+   * capability that needed the scope it lacks, so the translation has to sit on
+   * the request itself rather than on the handshake.
+   */
+  private async request<T>(serverName: string, run: (client: Client) => Promise<T>): Promise<T> {
+    const client = await this.get(serverName);
+    try {
+      return await run(client);
+    } catch (err) {
+      throw hinted(serverName, err);
     }
   }
 
   async callTool(serverName: string, name: string, args: unknown, timeoutMs = 120_000) {
-    const client = await this.get(serverName);
-    return withTimeout(
-      client.callTool({ name, arguments: (args ?? {}) as Record<string, unknown> }, undefined, {
-        timeout: timeoutMs,
-      }),
-      timeoutMs + 5000,
-      `${serverName}/${name}`,
+    return this.request(serverName, (client) =>
+      withTimeout(
+        client.callTool({ name, arguments: (args ?? {}) as Record<string, unknown> }, undefined, {
+          timeout: timeoutMs,
+        }),
+        timeoutMs + 5000,
+        `${serverName}/${name}`,
+      ),
     );
   }
 
   async getPrompt(serverName: string, name: string, args: Record<string, string> = {}) {
-    const client = await this.get(serverName);
-    return client.getPrompt({ name, arguments: args });
+    return this.request(serverName, (client) => client.getPrompt({ name, arguments: args }));
   }
 
   async readResource(serverName: string, uri: string) {
-    const client = await this.get(serverName);
-    return client.readResource({ uri });
+    return this.request(serverName, (client) => client.readResource({ uri }));
   }
 
   /**

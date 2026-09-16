@@ -46,3 +46,24 @@ export function unknownScopes(requested: string[], advertised: string[]): string
   const known = new Set(advertised);
   return requested.filter((s) => !known.has(s));
 }
+
+/**
+ * The scopes a resource will actually accept, given the two metadata documents.
+ *
+ * These disagree, and not symmetrically: an authorization server covers every
+ * API it fronts, while protected-resource metadata covers just the one
+ * resource. Supabase's authorization server lists 24 scopes for the whole
+ * Management API; its MCP resource accepts only the 13 it publishes, and
+ * rejects the authorize request outright — `scope.8: Invalid option` — if the
+ * extras are included. So the resource document wins whenever it says anything.
+ *
+ * The fallback matters just as much: Datadog's resource metadata lists no
+ * scopes and its authorization server publishes the one required scope
+ * (`mcp_all`), which must still be requested or the grant comes back unusable.
+ */
+export function requestableScopes(
+  resource: string[] | undefined,
+  authorizationServer: string[] | undefined,
+): string[] {
+  return [...new Set(resource?.length ? resource : (authorizationServer ?? []))];
+}

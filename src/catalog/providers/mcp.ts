@@ -2,8 +2,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ServerEntry } from "../../config/types.ts";
-import { backgroundAuth } from "../../config/oauth.ts";
+import { backgroundAuth, clearScopeChallenge, recordScopeChallenge } from "../../config/oauth.ts";
 import type { Capability } from "../types.ts";
 import { estimateTokens } from "../types.ts";
 
@@ -45,10 +46,29 @@ function httpTransport(entry: Extract<ServerEntry, { transport: "http" }>) {
   const init = {
     ...(entry.headers ? { requestInit: { headers: entry.headers } } : {}),
     authProvider: backgroundAuth(entry.name),
+    fetch: scopeAwareFetch(entry.name),
   };
   return /\/sse\/?$/.test(url.pathname)
     ? new SSEClientTransport(url, init)
     : new StreamableHTTPClientTransport(url, init);
+}
+
+/**
+ * Passes every response through untouched, noting the ones that carry an
+ * `insufficient_scope` challenge.
+ *
+ * The transport swallows a 403 whole — it retries internally and throws a
+ * message naming neither the scope nor the tool. This is the only point where
+ * the challenge is still intact, so the header is recorded here and read back
+ * by authHint() once the error surfaces.
+ */
+function scopeAwareFetch(server: string): FetchLike {
+  return async (url, init) => {
+    const res = await fetch(url, init);
+    if (res.status === 403) recordScopeChallenge(server, res.headers.get("www-authenticate"));
+    else if (res.ok) clearScopeChallenge(server);
+    return res;
+  };
 }
 
 export async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {

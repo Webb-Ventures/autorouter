@@ -11,7 +11,13 @@ import {
   setClientInformation,
   writeAuth,
 } from "../config/oauth.ts";
-import { isReadOnlyScope, parseScopeList, readOnlyScopes, unknownScopes } from "../config/scopes.ts";
+import {
+  isReadOnlyScope,
+  parseScopeList,
+  readOnlyScopes,
+  requestableScopes,
+  unknownScopes,
+} from "../config/scopes.ts";
 import type { ServerEntry } from "../config/types.ts";
 
 /**
@@ -35,6 +41,12 @@ export async function runLogin(opts: {
   scopes?: string;
   /** Request only the scopes that do not grant mutation. */
   readOnly?: boolean;
+  /**
+   * Request everything the server advertises, discarding any narrowing a
+   * previous grant carried. The escape hatch from a grant that was narrowed
+   * past what the server actually needs.
+   */
+  allScopes?: boolean;
   /** Print the available scopes and exit without authorizing. */
   listScopes?: boolean;
 }): Promise<{ ok: boolean; message: string }> {
@@ -55,7 +67,13 @@ export async function runLogin(opts: {
   else if (await hasAuth(entry.name)) {
     // A scope request against an existing grant is a no-op without --force, and
     // saying only "already has a grant" reads as though the narrowing applied.
-    const asked = opts.readOnly ? "--read-only" : opts.scopes ? "--scopes" : null;
+    const asked = opts.readOnly
+      ? "--read-only"
+      : opts.allScopes
+        ? "--all-scopes"
+        : opts.scopes
+          ? "--scopes"
+          : null;
     return {
       ok: true,
       message: asked
@@ -77,6 +95,7 @@ export async function runLogin(opts: {
   return await authorize(entry, port, {
     scopes: opts.scopes,
     readOnly: opts.readOnly,
+    allScopes: opts.allScopes,
     // A re-login inherits the narrowing from the grant it replaces. Without
     // this, `login --force` after a `--read-only` login quietly hands back a
     // full-access token.
@@ -86,9 +105,8 @@ export async function runLogin(opts: {
 
 /**
  * Shows what a server offers before committing to a browser flow. The two
- * metadata documents can disagree — Supabase's protected-resource metadata
- * lists only the read scopes while its authorization server lists all 13 — so
- * the union is what is actually requestable.
+ * metadata documents can disagree, so this reports the set the resource will
+ * actually accept rather than everything the authorization server fronts.
  */
 async function describeScopes(
   entry: Extract<ServerEntry, { transport: "http" }>,
@@ -115,16 +133,14 @@ async function describeScopes(
   };
 }
 
-/** Union of both metadata documents; either may be the more complete one. */
+/** What this resource accepts, per the precedence in requestableScopes(). */
 async function advertisedScopes(url: string): Promise<string[]> {
   try {
     const info = await discoverOAuthServerInfo(url);
-    return [
-      ...new Set([
-        ...(info.resourceMetadata?.scopes_supported ?? []),
-        ...(info.authorizationServerMetadata?.scopes_supported ?? []),
-      ]),
-    ];
+    return requestableScopes(
+      info.resourceMetadata?.scopes_supported,
+      info.authorizationServerMetadata?.scopes_supported,
+    );
   } catch {
     return [];
   }
@@ -133,7 +149,7 @@ async function advertisedScopes(url: string): Promise<string[]> {
 async function authorize(
   entry: Extract<ServerEntry, { transport: "http" }>,
   port: number,
-  want: { scopes?: string; readOnly?: boolean; previous?: string },
+  want: { scopes?: string; readOnly?: boolean; allScopes?: boolean; previous?: string },
 ): Promise<{ ok: boolean; message: string }> {
   // Captured after auth() generates it, and compared against what the browser
   // sends back.
@@ -186,16 +202,14 @@ async function authorize(
   let canRegister = true;
   try {
     const info = await discoverOAuthServerInfo(entry.url);
-    // The union, not the first non-empty one: Supabase's resource metadata
-    // lists 8 scopes while its authorization server lists 13, and the extra 5
-    // are the write scopes. Taking only the resource document would make
-    // --scopes silently reject names the provider does accept.
-    advertised = [
-      ...new Set([
-        ...(info.resourceMetadata?.scopes_supported ?? []),
-        ...(info.authorizationServerMetadata?.scopes_supported ?? []),
-      ]),
-    ];
+    // The resource document wins over the authorization server's when it says
+    // anything at all — the server's list spans every API it fronts, and
+    // Supabase rejects the authorize request outright when scopes outside the
+    // MCP resource's own 13 are included. See requestableScopes().
+    advertised = requestableScopes(
+      info.resourceMetadata?.scopes_supported,
+      info.authorizationServerMetadata?.scopes_supported,
+    );
     canRegister = Boolean(info.authorizationServerMetadata?.registration_endpoint);
   } catch {
     // Discovery failures are not fatal here — auth() repeats the discovery and
@@ -319,8 +333,16 @@ function escapeHtml(s: string): string {
  */
 export function chooseScopes(
   advertised: string[],
-  want: { scopes?: string; readOnly?: boolean; previous?: string },
+  want: { scopes?: string; readOnly?: boolean; allScopes?: boolean; previous?: string },
 ): { scope?: string; warn?: string[] } | { error: string } {
+  // --scopes stays the exact lever and still outranks both of these. But
+  // --read-only and --all-scopes are opposites with no defensible precedence,
+  // and quietly picking one would hand back a grant of the wrong breadth —
+  // the property least likely to be noticed after the fact.
+  if (want.readOnly && want.allScopes && !want.scopes) {
+    return { error: "--read-only and --all-scopes ask for opposite grants; pick one" };
+  }
+
   if (want.scopes) {
     const requested = parseScopeList(want.scopes);
     if (!requested.length) return { error: "--scopes was empty" };
@@ -330,6 +352,15 @@ export function chooseScopes(
     // provider is the one that gets to refuse it.
     const unknown = unknownScopes(requested, advertised);
     return { scope: requested.join(" "), ...(unknown.length ? { warn: unknown } : {}) };
+  }
+
+  if (want.allScopes) {
+    if (!advertised.length) {
+      return { error: "--all-scopes needs the server to advertise its scopes, and this one advertises none" };
+    }
+    // Deliberately ahead of `previous`: this flag exists to undo a narrowing,
+    // so inheriting the old one would defeat the only thing it does.
+    return { scope: advertised.join(" ") };
   }
 
   if (want.readOnly) {

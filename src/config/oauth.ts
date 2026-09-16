@@ -224,6 +224,52 @@ export class NeedsLoginError extends Error {
   }
 }
 
+/** An `insufficient_scope` challenge: the grant is valid, just too narrow. */
+export type ScopeChallenge = { required: string[]; description?: string };
+
+/**
+ * The most recent `insufficient_scope` challenge seen per server.
+ *
+ * A 403 never reaches the auth provider the way a 401 does. The transport
+ * handles it inline: it re-runs auth() hoping to widen the grant, and auth()
+ * takes the refresh path, which does not forward the new scope — so the same
+ * token comes back, the replay draws a byte-identical 403, and the transport
+ * gives up with `Server returned 403 after trying upscoping`, a message with
+ * every useful detail stripped out of it. Refreshing cannot widen a grant, so
+ * that retry can never succeed for a provider that binds scopes at issue time.
+ * Recording the challenge as it goes past is what lets authHint() name the
+ * missing scope instead of repeating the transport's dead end.
+ */
+const scopeChallenges = new Map<string, ScopeChallenge>();
+
+/** Parses the auth-params of an RFC 6750 `WWW-Authenticate` challenge. */
+function authParams(header: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const m of header.matchAll(/([A-Za-z_]+)\s*=\s*"([^"]*)"/g)) {
+    out[m[1]!.toLowerCase()] = m[2]!;
+  }
+  return out;
+}
+
+export function recordScopeChallenge(server: string, header: string | null | undefined): void {
+  if (!header) return;
+  const params = authParams(header);
+  if (params.error !== "insufficient_scope") return;
+  scopeChallenges.set(server, {
+    required: params.scope?.split(/\s+/).filter(Boolean) ?? [],
+    description: params.error_description,
+  });
+}
+
+/** Forgets a challenge once the server answers normally again. */
+export function clearScopeChallenge(server: string): void {
+  scopeChallenges.delete(server);
+}
+
+export function scopeChallenge(server: string): ScopeChallenge | undefined {
+  return scopeChallenges.get(server);
+}
+
 /**
  * Rewrites an authorization failure into the command that fixes it.
  *
@@ -232,9 +278,25 @@ export class NeedsLoginError extends Error {
  * indexing path and the call path — a token can expire between a reindex and a
  * tool call, and "Error POSTing to endpoint" is not an actionable thing to show
  * a model mid-task.
+ *
+ * A 403 is the same idea one step along: the grant exists but was narrowed
+ * past what the capability needs, and the fix is a different command.
  */
 export function authHint(server: string, err: unknown): string {
   const message = err instanceof Error ? err.message : String(err);
+  const challenge = scopeChallenges.get(server);
+  if (challenge && /\b403\b|insufficient_scope|upscoping/i.test(message)) {
+    const missing = challenge.required.length
+      ? `the ${challenge.required.join(", ")} scope${challenge.required.length > 1 ? "s" : ""}`
+      : "a scope";
+    return (
+      `grant is too narrow — this needs ${missing}, which the stored grant does not have.\n` +
+      `  Scopes are fixed when a grant is issued and refreshing cannot widen one, so this\n` +
+      `  will keep failing until the grant is replaced:\n` +
+      `    autorouter login ${server} --force --all-scopes` +
+      (challenge.description ? `\n  Server said: ${challenge.description}` : "")
+    );
+  }
   const unauthorized =
     err instanceof NeedsLoginError ||
     err instanceof UnauthorizedError ||

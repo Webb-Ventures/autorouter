@@ -13,10 +13,12 @@ import {
   readAuth,
   setClientInformation,
   writeAuth,
+  recordScopeChallenge,
+  clearScopeChallenge,
 } from "../src/config/oauth.ts";
 import { normalizeServer } from "../src/config/adapters/shared.ts";
 import { chooseScopes, summarizeScopes } from "../src/cli/login.ts";
-import { isReadOnlyScope } from "../src/config/scopes.ts";
+import { isReadOnlyScope, requestableScopes } from "../src/config/scopes.ts";
 
 let home: string;
 const prevHome = process.env.AUTOROUTER_HOME;
@@ -344,6 +346,44 @@ describe("scope selection", () => {
     "database:read", "database:write", "storage:read", "storage:write",
   ];
 
+  test("the resource's own scopes win over the authorization server's superset", () => {
+    // Regression: the union of both documents sent Supabase four scopes its MCP
+    // resource does not accept (analytics_config:read, auth:read, domains:read,
+    // rest:read), and the authorize request came back
+    // "scope.8: Invalid option" rather than opening a browser.
+    const resource = ["organizations:read", "projects:read", "database:write"];
+    const authServer = [...resource, "auth:read", "domains:read", "rest:write"];
+    expect(requestableScopes(resource, authServer)).toEqual(resource);
+    expect(chooseScopes(requestableScopes(resource, authServer), { readOnly: true }))
+      .toEqual({ scope: "organizations:read projects:read" });
+  });
+
+  test("falls back to the authorization server when the resource lists none", () => {
+    // Datadog: the one required scope lives only on the authorization server,
+    // and a grant issued without it is unusable.
+    expect(requestableScopes([], ["mcp_all"])).toEqual(["mcp_all"]);
+    expect(requestableScopes(undefined, ["mcp_all"])).toEqual(["mcp_all"]);
+    expect(requestableScopes(undefined, undefined)).toEqual([]);
+  });
+
+  test("--all-scopes overrides the narrowing a previous grant carried", () => {
+    // The escape hatch from the dead end below: a read-only grant against a
+    // server that exposes write tools cannot be widened by refreshing, and
+    // `login --force` alone replays `previous` and re-issues the same narrow
+    // grant. Without this flag there is no way out that does not involve
+    // retyping all 13 scope names.
+    const previous = "organizations:read projects:read";
+    expect(chooseScopes(SUPABASE, { allScopes: true, previous })).toEqual({
+      scope: SUPABASE.join(" "),
+    });
+  });
+
+  test("contradictory scope flags are refused rather than silently ranked", () => {
+    const bad = chooseScopes(SUPABASE, { allScopes: true, readOnly: true });
+    expect(bad).toHaveProperty("error");
+    expect((bad as { error: string }).error).toContain("pick one");
+  });
+
   test("classifies read and write scopes", () => {
     expect(isReadOnlyScope("database:read")).toBe(true);
     expect(isReadOnlyScope("database:write")).toBe(false);
@@ -406,5 +446,52 @@ describe("scope selection", () => {
     const line = summarizeScopes(many.join(" "));
     expect(line).toContain("21 granted, 1 of them write");
     expect(line).toContain("db:write");
+  });
+});
+
+
+describe("insufficient_scope challenges", () => {
+  const CHALLENGE =
+    'Bearer error="insufficient_scope", ' +
+    'error_description="This tool requires the database:write OAuth scope.", ' +
+    'scope="database:write", resource_metadata="https://mcp.supabase.com/.well-known/x"';
+
+  test("turns the transport's dead end into the command that fixes it", () => {
+    recordScopeChallenge("supabase", CHALLENGE);
+    // Verbatim from @modelcontextprotocol/sdk streamableHttp.js. The transport
+    // retries a 403 by re-running auth(), which refreshes -- and a refresh
+    // cannot widen a grant -- so the replay draws the identical 403 and this
+    // message is all that is left of it.
+    const hint = authHint("supabase", new Error("Server returned 403 after trying upscoping"));
+    expect(hint).toContain("database:write");
+    expect(hint).toContain("autorouter login supabase --force --all-scopes");
+    expect(hint).not.toContain("upscoping");
+    clearScopeChallenge("supabase");
+  });
+
+  test("a 401 still reports as a missing grant, not a narrow one", () => {
+    recordScopeChallenge("supabase", CHALLENGE);
+    expect(authHint("supabase", new Error("HTTP 401 Unauthorized"))).toBe(
+      "needs authorization \u2014 run: autorouter login supabase",
+    );
+    clearScopeChallenge("supabase");
+  });
+
+  test("challenges are per server and ignored when absent", () => {
+    recordScopeChallenge("supabase", CHALLENGE);
+    const other = authHint("linear", new Error("Server returned 403 after trying upscoping"));
+    expect(other).toBe("Server returned 403 after trying upscoping");
+    clearScopeChallenge("supabase");
+  });
+
+  test("ignores a 403 that is not about scope", () => {
+    recordScopeChallenge("stripe", 'Bearer error="invalid_token"');
+    expect(authHint("stripe", new Error("boom 403"))).toBe("boom 403");
+  });
+
+  test("an unrelated error is passed through untouched", () => {
+    recordScopeChallenge("supabase", CHALLENGE);
+    expect(authHint("supabase", new Error("ECONNRESET"))).toBe("ECONNRESET");
+    clearScopeChallenge("supabase");
   });
 });
