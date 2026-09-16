@@ -40,6 +40,14 @@ export type StoredAuth = {
    * back to everything the provider advertises.
    */
   requestedScope?: string;
+  /**
+   * Whether `clientInformation` was registered with the device grant in its
+   * grant_types. A client registered for the browser flow alone is refused at
+   * the device endpoint by any provider that enforces the field, and the
+   * refusal (`unauthorized_client`) says nothing about the cause — so the
+   * device flow re-registers rather than reusing a client that predates it.
+   */
+  deviceClient?: boolean;
 };
 
 export function oauthDir(): string {
@@ -81,6 +89,9 @@ export async function clearAuth(server: string): Promise<void> {
 export async function hasAuth(server: string): Promise<boolean> {
   return Boolean((await readAuth(server)).tokens?.access_token);
 }
+
+/** RFC 8628 §3.4. Spelled out because it appears in two unrelated requests. */
+export const DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code";
 
 const CLIENT_METADATA: OAuthClientMetadata = {
   client_name: "autorouter",
@@ -127,6 +138,24 @@ export class FileTokenStore implements OAuthClientProvider {
 
   get clientMetadata(): OAuthClientMetadata {
     return { ...CLIENT_METADATA, redirect_uris: [this.redirectUrl] };
+  }
+
+  /**
+   * Registration metadata for an RFC 8628 login: the browser client plus the
+   * device grant.
+   *
+   * The device grant never redirects, so dropping `redirect_uris` here is
+   * tempting — but RFC 7591 requires them for `authorization_code`, and a
+   * provider that validates the pair rejects the registration outright. Keeping
+   * both means the one client is valid for either flow, which also makes this a
+   * strict superset: a device login on a box that later grows a browser does
+   * not need registering again.
+   */
+  get deviceClientMetadata(): OAuthClientMetadata {
+    return {
+      ...this.clientMetadata,
+      grant_types: [...CLIENT_METADATA.grant_types!, DEVICE_GRANT_TYPE],
+    };
   }
 
   /**

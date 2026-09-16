@@ -366,6 +366,7 @@ autorouter restore --target claude                  # undo the most recent adopt
 
 autorouter login                                    # which servers need a grant
 autorouter login remote-server                      # authorize one (opens a browser)
+autorouter login remote-server --device             # headless: enter a code elsewhere
 autorouter logout remote-server                     # forget a stored grant
 ```
 
@@ -390,6 +391,35 @@ are refreshed automatically; `logout` deletes them. The loopback redirect uses a
 fixed port (33418, `--port` or `$AUTOROUTER_OAUTH_PORT` to change it) because the
 redirect URI is baked into the registration a provider stores — a grant obtained
 on one port cannot be refreshed from another.
+
+### Headless machines
+
+The browser flow cannot work over SSH: it binds a loopback listener and expects
+a browser on the same host to redirect into it. Two flows replace it, and on a
+box with no display autorouter picks one of them by itself rather than timing
+out waiting for a browser that was never going to open.
+
+```sh
+autorouter login remote-server --device   # RFC 8628: enter a code on your phone
+autorouter login remote-server --manual   # paste the redirect URL back
+```
+
+`--device` is the better one where the provider offers it. Nothing has to reach
+back into the machine: it prints a short code and a URL, you enter them in a
+browser on any other device, and the headless side polls until you are done.
+Detection is the `device_authorization_endpoint` in the provider's metadata.
+
+`--manual` is the fallback for providers that do not implement RFC 8628. It
+prints the authorization URL, you open it elsewhere, and the browser is then
+redirected to `http://localhost:33418/callback`, which will not load — nothing
+is listening. That is expected: copy the URL out of the address bar and paste it
+back. Pasting the whole URL is worth preferring over just the code, because the
+`state` in it is what proves the code came from the login you started.
+
+Neither flow binds a port. A device login registers a client that also works for
+a later browser login from the same machine, so nothing has to be redone if the
+box grows a display. Set `AUTOROUTER_ASSUME_HEADLESS=1` to force the detection
+on a machine where it guesses wrong.
 
 ### Choosing permissions
 

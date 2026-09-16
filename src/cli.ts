@@ -23,7 +23,8 @@ const USAGE = `autorouter — one search tool instead of every tool
   autorouter list [--kind K]           List everything in the catalog
   autorouter reindex                   Rebuild the catalog now
   autorouter doctor                    Show what is reachable and what it saves
-  autorouter login [server]            Authorize an OAuth server (opens a browser);
+  autorouter login [server]            Authorize an OAuth server (opens a browser,
+                                       or prints a code on a headless box);
                                        with no argument, lists what needs one
   autorouter logout <server>           Forget a stored grant
   autorouter add <name> --url URL      Register a server with the router directly
@@ -63,6 +64,10 @@ Options
                  any narrowing the previous grant carried
   --scopes S     login: request exactly these scopes (comma or space separated)
   --list-scopes  login: show what the server offers, authorize nothing
+  --device       login: RFC 8628 — print a code to enter on another device and
+                 poll for the result. No browser or open port needed here.
+  --manual       login: print the authorization URL, then read the redirect you
+                 paste back. Works where the provider has no device endpoint.
 
 \`add\` registers behind the router, so a new server never enters your context.
 Servers added to a harness the normal way (\`claude mcp add\`) are moved behind
@@ -210,6 +215,7 @@ async function cmdLogin(server: string | undefined, flags: Flags): Promise<numbe
       }),
     );
     console.log("Usage: autorouter login <server> [--read-only | --all-scopes | --scopes a,b]\n");
+    console.log("  On a machine with no browser, add --device (or --manual).\n");
     for (const s of states) {
       const scope = s.ok && s.scope ? `  ${summarizeScopes(s.scope)}` : "";
       console.log(`  ${s.ok ? "ok  " : "-   "} ${s.name}${scope}`);
@@ -240,6 +246,8 @@ async function cmdLogin(server: string | undefined, flags: Flags): Promise<numbe
     readOnly: Boolean(flags["read-only"]),
     allScopes: Boolean(flags["all-scopes"]),
     listScopes: Boolean(flags["list-scopes"]),
+    device: Boolean(flags.device),
+    manual: Boolean(flags.manual),
   });
   console.log(result.message);
   if (result.ok && !flags["list-scopes"]) {
@@ -578,7 +586,7 @@ function parseArgs(argv: string[]): {
       // carries the pasted server snippet for `add`. Resolving that by command
       // keeps the flag named the way the vendor docs people copy from name it.
       const boolean =
-        ["raw", "json", "yes", "dry-run", "force", "servers-only", "read-only", "all-scopes", "list-scopes"].includes(name) &&
+        ["raw", "json", "yes", "dry-run", "force", "servers-only", "read-only", "all-scopes", "list-scopes", "device", "manual"].includes(name) &&
         !(name === "json" && command === "add");
       if (boolean) {
         flags[name] = true as any;

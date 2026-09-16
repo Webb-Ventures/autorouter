@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Headless login. `autorouter login --device` runs the RFC 8628 device
+  authorization grant — it prints a short code and a URL to enter on any other
+  device and polls for the result, so nothing has to reach back into the
+  machine. `--manual` covers providers that do not implement RFC 8628 by
+  printing the authorization URL and reading the redirect you paste back.
+  Neither binds a port. On a box with no display one of the two is now chosen
+  automatically instead of waiting out a five-minute timeout for a browser that
+  was never going to open; `AUTOROUTER_ASSUME_HEADLESS=1` forces that detection.
 - `autorouter add` / `autorouter remove`: register a server with the router
   directly, by `--url`, by `--command` or a `--` passthrough, or from a pasted
   `{"mcpServers": …}` snippet via `--json`.

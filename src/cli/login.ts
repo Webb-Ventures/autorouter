@@ -1,7 +1,9 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { auth, discoverOAuthServerInfo } from "@modelcontextprotocol/sdk/client/auth.js";
+import type { OAuthServerInfo } from "@modelcontextprotocol/sdk/client/auth.js";
 import { resolveConfig } from "../config/resolve.ts";
+import { deviceEndpoint, looksHeadless, runDeviceFlow } from "./device.ts";
 import {
   CALLBACK_PORT,
   FileTokenStore,
@@ -49,6 +51,10 @@ export async function runLogin(opts: {
   allScopes?: boolean;
   /** Print the available scopes and exit without authorizing. */
   listScopes?: boolean;
+  /** Force RFC 8628: print a code to enter on another device, poll for the result. */
+  device?: boolean;
+  /** Force the paste-the-code flow: print the URL, read the redirect back in. */
+  manual?: boolean;
 }): Promise<{ ok: boolean; message: string }> {
   const resolved = await resolveConfig(opts.cwd);
   const entry = resolved.servers.find((s) => s.name === opts.server);
@@ -85,6 +91,10 @@ export async function runLogin(opts: {
     };
   }
 
+  if (opts.device && opts.manual) {
+    return { ok: false, message: "--device and --manual are different flows; pick one." };
+  }
+
   const port = opts.port ?? CALLBACK_PORT;
   if (opts.clientId) {
     await setClientInformation(entry.name, {
@@ -92,7 +102,7 @@ export async function runLogin(opts: {
       ...(opts.clientSecret ? { client_secret: opts.clientSecret } : {}),
     });
   }
-  return await authorize(entry, port, {
+  const want = {
     scopes: opts.scopes,
     readOnly: opts.readOnly,
     allScopes: opts.allScopes,
@@ -100,7 +110,78 @@ export async function runLogin(opts: {
     // this, `login --force` after a `--read-only` login quietly hands back a
     // full-access token.
     previous: previousScope,
-  });
+  };
+
+  const mode = await resolveMode(entry, opts);
+  if (mode.kind === "device") {
+    const chosen = chooseScopes(mode.advertised, want);
+    if ("error" in chosen) return { ok: false, message: `${entry.name}: ${chosen.error}` };
+    if (mode.announce) console.log(mode.announce);
+    const result = await runDeviceFlow({
+      server: entry.name,
+      url: entry.url,
+      scope: chosen.scope,
+      info: mode.info,
+      port,
+    });
+    if (!result.ok) return result;
+    return {
+      ok: true,
+      message:
+        `${entry.name}: authorized.` +
+        (result.grantedScope ? `\n  ${summarizeScopes(result.grantedScope)}` : ""),
+    };
+  }
+  if (mode.announce) console.log(mode.announce);
+  return await authorize(entry, port, want, mode.kind);
+}
+
+/**
+ * Picks between the three ways of getting a grant.
+ *
+ * An explicit flag always wins. Otherwise the browser flow is right on a
+ * desktop and impossible over SSH, so a headless box is moved off it
+ * automatically — silently defaulting to a flow that binds a loopback listener
+ * and shells out to xdg-open leaves the user watching a five-minute timeout for
+ * a browser that was never going to open. Which of the two headless flows is
+ * available depends on the provider, so this asks before choosing.
+ */
+async function resolveMode(
+  entry: Extract<ServerEntry, { transport: "http" }>,
+  opts: { device?: boolean; manual?: boolean },
+): Promise<
+  | { kind: "device"; info?: OAuthServerInfo; advertised: string[]; announce?: string }
+  | { kind: "browser" | "manual"; announce?: string }
+> {
+  if (opts.manual) return { kind: "manual" };
+
+  // Discovery is needed either way here: --device still has to resolve scopes,
+  // or --read-only would fail claiming the server advertises none. Failures are
+  // not fatal — the flow that runs next repeats discovery and reports properly.
+  if (opts.device) {
+    const info = await discoverOAuthServerInfo(entry.url).catch(() => undefined);
+    return { kind: "device", info, advertised: advertisedFrom(info) };
+  }
+  if (!looksHeadless()) return { kind: "browser" };
+
+  const info = await discoverOAuthServerInfo(entry.url).catch(() => undefined);
+  if (info && deviceEndpoint(info.authorizationServerMetadata)) {
+    return {
+      kind: "device",
+      info,
+      advertised: advertisedFrom(info),
+      announce:
+        `No display detected, so this is using the device flow instead of opening a browser.\n` +
+        `  Pass --manual to paste a redirect URL instead, or --port with X11/SSH forwarding to\n` +
+        `  use the browser flow anyway.`,
+    };
+  }
+  return {
+    kind: "manual",
+    announce:
+      `No display detected, and ${entry.name} does not offer the device flow — falling back to\n` +
+      `  the paste-the-code flow. Open the URL below on any machine with a browser.`,
+  };
 }
 
 /**
@@ -133,6 +214,14 @@ async function describeScopes(
   };
 }
 
+/** The same precedence as advertisedScopes(), over discovery already in hand. */
+function advertisedFrom(info: OAuthServerInfo | undefined): string[] {
+  return requestableScopes(
+    info?.resourceMetadata?.scopes_supported,
+    info?.authorizationServerMetadata?.scopes_supported,
+  );
+}
+
 /** What this resource accepts, per the precedence in requestableScopes(). */
 async function advertisedScopes(url: string): Promise<string[]> {
   try {
@@ -150,6 +239,7 @@ async function authorize(
   entry: Extract<ServerEntry, { transport: "http" }>,
   port: number,
   want: { scopes?: string; readOnly?: boolean; allScopes?: boolean; previous?: string },
+  mode: "browser" | "manual" = "browser",
 ): Promise<{ ok: boolean; message: string }> {
   // Captured after auth() generates it, and compared against what the browser
   // sends back.
@@ -183,14 +273,19 @@ async function authorize(
     else resolveCode(code!);
   });
 
-  await new Promise<void>((res, rej) => {
-    server.once("error", rej);
-    server.listen(port, "127.0.0.1", res);
-  }).catch((err: NodeJS.ErrnoException) => {
-    throw err.code === "EADDRINUSE"
-      ? new Error(`Port ${port} is in use. Pass --port to pick another (it must stay the same across logins).`)
-      : err;
-  });
+  // The manual flow has nothing to receive: the redirect lands in a browser on
+  // some other machine and the user carries the code back by hand. Binding a
+  // listener on a headless box would only be one more thing to fail.
+  if (mode === "browser") {
+    await new Promise<void>((res, rej) => {
+      server.once("error", rej);
+      server.listen(port, "127.0.0.1", res);
+    }).catch((err: NodeJS.ErrnoException) => {
+      throw err.code === "EADDRINUSE"
+        ? new Error(`Port ${port} is in use. Pass --port to pick another (it must stay the same across logins).`)
+        : err;
+    });
+  }
 
   // SEP-835 scope selection inside auth() only consults the *resource* metadata
   // and falls back to client metadata. Datadog publishes its one required scope
@@ -242,6 +337,15 @@ async function authorize(
   }
 
   const provider = new FileTokenStore(entry.name, port, (url) => {
+    if (mode === "manual") {
+      console.log(
+        `\nOpen this on any machine with a browser and authorize ${entry.name}:\n\n  ${url}\n\n` +
+          `The browser will then be redirected to ${`http://localhost:${port}/callback`}, which\n` +
+          `will not load — that is expected, nothing is listening there. Copy the full URL out of\n` +
+          `the address bar and paste it below.\n`,
+      );
+      return;
+    }
     console.log(`\nOpening your browser to authorize ${entry.name}:\n  ${url}\n`);
     openBrowser(url.toString());
   });
@@ -252,9 +356,13 @@ async function authorize(
       return { ok: true, message: `${entry.name}: already authorized (existing grant is still valid).` };
     }
 
-    // auth() returned REDIRECT: the browser is open, wait for the callback.
+    // auth() returned REDIRECT: the URL has been printed (and, in browser mode,
+    // opened). Where the code comes back from is the only difference.
     pendingState = (await readAuth(entry.name)).state;
-    const code = await withTimeout(codePromise, 5 * 60_000, "waiting for the browser callback");
+    const code =
+      mode === "manual"
+        ? await readPastedCode(pendingState)
+        : await withTimeout(codePromise, 5 * 60_000, "waiting for the browser callback");
     const result = await auth(provider, { serverUrl: entry.url, authorizationCode: code, scope });
     if (result !== "AUTHORIZED") {
       return { ok: false, message: `${entry.name}: token exchange did not complete (${result}).` };
@@ -296,6 +404,54 @@ export function evaluateCallback(
   return {
     failure: description ? `${error ?? "error"}: ${description}` : (error ?? "no code returned"),
   };
+}
+
+/**
+ * Reads the redirect back from the user and extracts the code.
+ *
+ * Accepts the whole URL or just the code, because people paste whichever is
+ * easier to select. The whole URL is worth preferring: it carries the `state`,
+ * which is the only way to tell a code from the login we started apart from one
+ * handed over by a page the user was shown along the way (RFC 6749 §10.12). A
+ * bare code cannot be checked, so it is accepted on the user's word.
+ */
+async function readPastedCode(expectedState: string | undefined): Promise<string> {
+  const { createInterface } = await import("node:readline/promises");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const answer = (await rl.question("Paste the full redirect URL (or just the code): ")).trim();
+      if (!answer) continue;
+      const parsed = parsePastedRedirect(answer, expectedState);
+      if ("code" in parsed) return parsed.code;
+      console.log(`  ${parsed.error}`);
+    }
+    throw new Error("no usable authorization code was pasted");
+  } finally {
+    rl.close();
+  }
+}
+
+/** Pulls a code out of whatever the user pasted, validating state when present. */
+export function parsePastedRedirect(
+  input: string,
+  expectedState: string | undefined,
+): { code: string } | { error: string } {
+  const trimmed = input.trim();
+  if (!/^https?:\/\//i.test(trimmed)) {
+    // A bare code. Anything with whitespace or a query separator in it is a
+    // mangled paste, not a code, and exchanging it would fail confusingly.
+    if (/[\s?&]/.test(trimmed)) return { error: "that does not look like a URL or a code — try again" };
+    return { code: trimmed };
+  }
+  let params: URLSearchParams;
+  try {
+    params = new URL(trimmed).searchParams;
+  } catch {
+    return { error: "that URL could not be parsed — paste the whole address bar" };
+  }
+  const { code, failure } = evaluateCallback(params, expectedState);
+  return code ? { code } : { error: failure ?? "no code in that URL" };
 }
 
 function openBrowser(url: string): void {
