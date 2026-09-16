@@ -70,6 +70,7 @@ Options
                  any narrowing the previous grant carried
   --scopes S     login: request exactly these scopes (comma or space separated)
   --list-scopes  login: show what the server offers, authorize nothing
+  --no-reindex   login: skip the reindex that otherwise follows a new grant
   --device       login: RFC 8628 — print a code to enter on another device and
                  poll for the result. No browser or open port needed here.
   --manual       login: print the authorization URL, then read the redirect you
@@ -106,14 +107,9 @@ async function main(argv: string[]): Promise<number> {
     case "list":
       return await cmdList(flags);
 
-    case "reindex": {
-      const router = await Router.create({ force: true });
-      console.log(`Reindexed: ${router.summary()}`);
-      const failures = Object.entries(router.catalog.errors);
-      for (const [name, err] of failures) console.error(`  unreachable: ${name}: ${oneLine(err, 100)}`);
-      await router.close();
+    case "reindex":
+      await cmdReindex();
       return 0;
-    }
 
     case "doctor":
       console.log(await runDoctor(process.cwd()));
@@ -209,6 +205,23 @@ async function cmdRemove(name: string | undefined): Promise<number> {
   return 0;
 }
 
+/**
+ * Rebuilds the catalog and reports what came back.
+ *
+ * Shared with `login`, which runs it automatically: a fresh grant is only worth
+ * having once the capabilities behind it are in the index, and leaving that as
+ * a second command the user has to remember means the server stays invisible
+ * until they do.
+ */
+async function cmdReindex(): Promise<void> {
+  const router = await Router.create({ force: true });
+  console.log(`Reindexed: ${router.summary()}`);
+  for (const [name, err] of Object.entries(router.catalog.errors)) {
+    console.error(`  unreachable: ${name}: ${oneLine(err, 100)}`);
+  }
+  await router.close();
+}
+
 async function cmdLogin(server: string | undefined, flags: Flags): Promise<number> {
   if (!server) {
     // Without an argument, show which http servers still need a grant rather
@@ -268,10 +281,23 @@ async function cmdLogin(server: string | undefined, flags: Flags): Promise<numbe
     manual: Boolean(flags.manual),
   });
   console.log(result.message);
-  if (result.ok && !flags["list-scopes"]) {
-    console.log("Re-run `autorouter reindex` to pick up its capabilities.");
+  if (!result.authorized) return result.ok ? 0 : 1;
+
+  if (flags["no-reindex"]) {
+    console.log("Skipped the reindex; run `autorouter reindex` to pick up its capabilities.");
+    return 0;
   }
-  return result.ok ? 0 : 1;
+  try {
+    await cmdReindex();
+  } catch (err) {
+    // The grant is stored either way, and saying otherwise would send the user
+    // back to re-run a login that already worked.
+    console.error(
+      `\nThe grant was saved, but the reindex failed: ${oneLine(err instanceof Error ? err.message : String(err), 200)}\n` +
+        `  Run \`autorouter reindex\` once that is resolved.`,
+    );
+  }
+  return 0;
 }
 
 async function cmdLogout(server: string | undefined): Promise<number> {
@@ -604,7 +630,7 @@ function parseArgs(argv: string[]): {
       // carries the pasted server snippet for `add`. Resolving that by command
       // keeps the flag named the way the vendor docs people copy from name it.
       const boolean =
-        ["raw", "json", "yes", "dry-run", "force", "servers-only", "read-only", "all-scopes", "list-scopes", "device", "manual", "check"].includes(name) &&
+        ["raw", "json", "yes", "dry-run", "force", "servers-only", "read-only", "all-scopes", "list-scopes", "device", "manual", "check", "no-reindex"].includes(name) &&
         !(name === "json" && command === "add");
       if (boolean) {
         flags[name] = true as any;

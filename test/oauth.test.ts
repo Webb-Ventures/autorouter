@@ -170,6 +170,40 @@ describe("autorouter login", () => {
       expect(result.ok).toBe(true);
       expect(result.message).toContain("--force");
       expect(await hasAuth("remote")).toBe(true);
+      // Nothing changed, so the automatic reindex must not fire.
+      expect(result.authorized).toBeFalsy();
+    } finally {
+      if (prevCfg !== undefined) process.env.AUTOROUTER_CONFIG = prevCfg;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("only a call that stores a new grant reports `authorized`", async () => {
+    // `ok` is true for --list-scopes and for a server that already had a grant.
+    // The reindex keys off `authorized` instead, because neither of those
+    // changes what the router can reach and a reindex is not free.
+    const { runLogin } = await import("../src/cli/login.ts");
+    const cwd = await mkdtemp(join(tmpdir(), "autorouter-cwd-"));
+    await Bun.write(
+      join(cwd, ".autorouter.json"),
+      JSON.stringify({
+        import: [],
+        servers: { remote: { url: "https://example.com/mcp" }, local: { command: "echo", args: ["hi"] } },
+      }),
+    );
+    await writeAuth("remote", { tokens: { access_token: "t", token_type: "Bearer" } });
+    const prevCfg = process.env.AUTOROUTER_CONFIG;
+    delete process.env.AUTOROUTER_CONFIG;
+    try {
+      for (const opts of [
+        { server: "nope", cwd }, // unknown server
+        { server: "local", cwd }, // stdio, OAuth does not apply
+        { server: "remote", cwd }, // already granted
+        { server: "remote", cwd, device: true, manual: true }, // conflicting flags
+      ]) {
+        const result = await runLogin(opts);
+        expect(result.authorized).toBeFalsy();
+      }
     } finally {
       if (prevCfg !== undefined) process.env.AUTOROUTER_CONFIG = prevCfg;
       await rm(cwd, { recursive: true, force: true });

@@ -370,6 +370,7 @@ autorouter update --check                           # is there a newer version?
 autorouter login                                    # which servers need a grant
 autorouter login remote-server                      # authorize one (opens a browser)
 autorouter login remote-server --device             # headless: enter a code elsewhere
+autorouter login remote-server --no-reindex         # authorize, index later
 autorouter logout remote-server                     # forget a stored grant
 ```
 
@@ -410,8 +411,16 @@ has a token to borrow:
 
 ```sh
 autorouter login remote-server
-autorouter reindex
 ```
+
+A new grant is followed by a reindex automatically, because the capabilities
+behind it are not searchable until the catalog has seen them — a grant on its
+own changes nothing the router can reach. `--no-reindex` skips it when you are
+authorizing several servers in a row and would rather index once at the end.
+
+Only a login that actually stores a new grant triggers it. `--list-scopes` and a
+server that already had a grant both change nothing, so neither pays for an
+index rebuild.
 
 Registration is RFC 7591 dynamic client registration, so there is no app to
 create first. Tokens live in `~/.autorouter/oauth/<server>.json` at `0600` and

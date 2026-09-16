@@ -31,6 +31,17 @@ import type { ServerEntry } from "../config/types.ts";
  * registration made on one port is useless on the next run.
  */
 
+export type LoginResult = {
+  ok: boolean;
+  message: string;
+  /**
+   * A grant was newly stored by this call. Distinct from `ok`, which is also
+   * true for `--list-scopes` and for a server that already had one — neither
+   * changes what the router can reach, so neither should trigger a reindex.
+   */
+  authorized?: boolean;
+};
+
 export async function runLogin(opts: {
   server: string;
   cwd: string;
@@ -55,7 +66,7 @@ export async function runLogin(opts: {
   device?: boolean;
   /** Force the paste-the-code flow: print the URL, read the redirect back in. */
   manual?: boolean;
-}): Promise<{ ok: boolean; message: string }> {
+}): Promise<LoginResult> {
   const resolved = await resolveConfig(opts.cwd);
   const entry = resolved.servers.find((s) => s.name === opts.server);
   if (!entry) {
@@ -127,6 +138,7 @@ export async function runLogin(opts: {
     if (!result.ok) return result;
     return {
       ok: true,
+      authorized: true,
       message:
         `${entry.name}: authorized.` +
         (result.grantedScope ? `\n  ${summarizeScopes(result.grantedScope)}` : ""),
@@ -191,7 +203,7 @@ async function resolveMode(
  */
 async function describeScopes(
   entry: Extract<ServerEntry, { transport: "http" }>,
-): Promise<{ ok: boolean; message: string }> {
+): Promise<LoginResult> {
   const advertised = await advertisedScopes(entry.url);
   if (!advertised.length) {
     return {
@@ -240,7 +252,7 @@ async function authorize(
   port: number,
   want: { scopes?: string; readOnly?: boolean; allScopes?: boolean; previous?: string },
   mode: "browser" | "manual" = "browser",
-): Promise<{ ok: boolean; message: string }> {
+): Promise<LoginResult> {
   // Captured after auth() generates it, and compared against what the browser
   // sends back.
   let pendingState: string | undefined;
@@ -353,7 +365,13 @@ async function authorize(
   try {
     const first = await auth(provider, { serverUrl: entry.url, scope });
     if (first === "AUTHORIZED") {
-      return { ok: true, message: `${entry.name}: already authorized (existing grant is still valid).` };
+      // hasAuth() was false on the way in, so auth() just obtained or refreshed
+      // a token that was not on disk before — new reach, and worth indexing.
+      return {
+        ok: true,
+        authorized: true,
+        message: `${entry.name}: already authorized (existing grant is still valid).`,
+      };
     }
 
     // auth() returned REDIRECT: the URL has been printed (and, in browser mode,
@@ -373,7 +391,11 @@ async function authorize(
     // differ more often than not — a provider may drop a scope it does not
     // recognise and issue the rest without saying so.
     const granted = stored.tokens?.scope ?? scope;
-    return { ok: true, message: `${entry.name}: authorized.${granted ? `\n  ${summarizeScopes(granted)}` : ""}` };
+    return {
+      ok: true,
+      authorized: true,
+      message: `${entry.name}: authorized.${granted ? `\n  ${summarizeScopes(granted)}` : ""}`,
+    };
   } catch (err) {
     return { ok: false, message: `${entry.name}: ${err instanceof Error ? err.message : String(err)}` };
   } finally {

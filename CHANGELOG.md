@@ -36,6 +36,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `autorouter login` reindexes automatically once a new grant is stored, so a
+  freshly authorized server is searchable without a second command.
+  `--no-reindex` skips it. Only a login that actually stores a grant triggers
+  the rebuild — `--list-scopes` and an already-authorized server do not.
 - Skills are no longer republished as MCP prompts by default (`promptMode:
   "commands"`). The prompt list is permanent context and skills were the bulk of
   it — one plugin shipping 141 skills cost ~11.5k tokens per turn, more than
