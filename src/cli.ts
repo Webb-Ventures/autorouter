@@ -12,6 +12,7 @@ import { resolveConfig } from "./config/resolve.ts";
 import { renderCapability, renderRouteResult, oneLine } from "./server/render.ts";
 import type { CapabilityKind } from "./catalog/types.ts";
 import { loadCatalog } from "./catalog/build.ts";
+import { tuneConnectionRacing } from "./util/net.ts";
 
 const VERSION = "0.1.0";
 
@@ -87,6 +88,10 @@ one-time step before those can be adopted.
 `;
 
 async function main(argv: string[]): Promise<number> {
+  // Every command below can reach a downstream HTTP server, so this belongs
+  // ahead of the dispatch rather than inside serve().
+  tuneConnectionRacing();
+
   const { command, positionals, flags, rest } = parseArgs(argv);
 
   switch (command) {
