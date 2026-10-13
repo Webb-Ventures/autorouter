@@ -14,7 +14,7 @@ import type { CapabilityKind } from "./catalog/types.ts";
 import { loadCatalog } from "./catalog/build.ts";
 import { tuneConnectionRacing } from "./util/net.ts";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.8";
 
 const USAGE = `autorouter — one search tool instead of every tool
 
