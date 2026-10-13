@@ -33,6 +33,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with `confirm: true` proceeds. Disable with `"allowAddServer": false`.
 - `promptMode` (`all` | `commands` | `none`) and `activation`
   (`eager` | `lazy` | `off`) settings.
+- cmux's Computer Use server (`cmux-cua`) is imported while cmux is running.
+  cmux injects it per session with `--mcp-config` rather than writing it to a
+  config file, so no existing importer could see it. On by default as the
+  `cmux` import source.
 
 ### Changed
 
@@ -57,6 +61,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Servers switched off with Codex's `enabled = false` are no longer launched.
+  Only `disabled: true` was honoured, so the ChatGPT desktop app — which the
+  Codex app registers as the `cua_repl` server — opened on every restart and
+  re-index. As a backstop, a command that is a regular macOS app's main
+  executable is never launched, since it opens the app instead of serving MCP.
+- OAuth refreshes are serialized across routers. Each harness session runs its
+  own router against the same token file, and providers that rotate refresh
+  tokens (Stripe) rejected whichever router refreshed second, after which the
+  SDK deleted the stored grant and every session was logged out.
 - Harness config files are now fingerprinted by the catalog. A server added with
   `claude mcp add` was previously invisible to a running router until the 6-hour
   TTL expired.

@@ -184,7 +184,12 @@ that would carry them is permanent context — see [Slash commands](#slash-comma
 
 Harness configs are imported rather than duplicated: `~/.claude.json` (global and
 per-project) and `.mcp.json`, `~/.codex/config.toml`, `~/.cursor/mcp.json`,
-`~/.vscode/mcp.json`, and installed Claude Code plugins.
+`~/.vscode/mcp.json`, and installed Claude Code plugins. While the
+cmux terminal is running, its Computer Use server
+(`cmux-cua`) is picked up too, since cmux injects it per session rather than
+writing it to any config. Servers a harness has switched off (`disabled: true`,
+or Codex's `enabled = false`) are skipped, and a command that would just open a
+desktop app — rather than start an MCP server — is never launched.
 
 ## Adding an MCP server
 
@@ -221,7 +226,7 @@ it takes a second call with `confirm: true` to write anything. Set
 
 ```jsonc
 {
-  "import": ["claude", "codex", "cursor", "plugins"],
+  "import": ["claude", "codex", "cursor", "vscode", "plugins", "cmux"],
   "servers": { "custom": { "command": "…", "args": [] } },
   "skillPaths": ["~/.claude/skills", ".claude/skills"],
   "exclude": ["media.generate_video"], // never surfaced at all

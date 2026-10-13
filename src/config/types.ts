@@ -62,7 +62,7 @@ export type RouterConfig = {
   /** Harness configs to import servers from. */
   import: string[];
   /** Extra servers declared directly. */
-  servers: Record<string, Partial<ServerSpec> & { command?: string; args?: string[]; url?: string; disabled?: boolean; env?: Record<string, string> }>;
+  servers: Record<string, Partial<ServerSpec> & { command?: string; args?: string[]; url?: string; disabled?: boolean; enabled?: boolean; env?: Record<string, string> }>;
   skillPaths: string[];
   /** Capability id globs that are never surfaced. */
   exclude: string[];
@@ -118,7 +118,7 @@ export type RouterConfig = {
 };
 
 export const DEFAULT_CONFIG: RouterConfig = {
-  import: ["claude", "codex", "cursor", "vscode", "plugins"],
+  import: ["claude", "codex", "cursor", "vscode", "plugins", "cmux"],
   servers: {},
   skillPaths: ["~/.claude/skills", ".claude/skills", "~/.config/skills"],
   exclude: [],

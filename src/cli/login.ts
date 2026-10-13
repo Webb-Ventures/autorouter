@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { auth, discoverOAuthServerInfo } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { OAuthServerInfo } from "@modelcontextprotocol/sdk/client/auth.js";
 import { resolveConfig } from "../config/resolve.ts";
+import { serializeRefresh } from "../config/refresh.ts";
 import { deviceEndpoint, looksHeadless, runDeviceFlow } from "./device.ts";
 import {
   CALLBACK_PORT,
@@ -363,7 +364,7 @@ async function authorize(
   });
 
   try {
-    const first = await auth(provider, { serverUrl: entry.url, scope });
+    const first = await auth(provider, { serverUrl: entry.url, scope, fetchFn: serializeRefresh(entry.name, fetch) });
     if (first === "AUTHORIZED") {
       // hasAuth() was false on the way in, so auth() just obtained or refreshed
       // a token that was not on disk before — new reach, and worth indexing.

@@ -5,6 +5,7 @@ import { loadClaude } from "./adapters/claude.ts";
 import { loadCursor, loadVscode } from "./adapters/cursor.ts";
 import { loadCodex } from "./adapters/codex.ts";
 import { loadPluginServers } from "./adapters/plugins.ts";
+import { cmuxSocketPath, loadCmux } from "./adapters/cmux.ts";
 import { isSelfReference, normalizeServer, specKey } from "./adapters/shared.ts";
 
 export type ResolvedConfig = {
@@ -40,6 +41,9 @@ function harnessSources(name: string, cwd: string): string[] {
       return [join(home, ".codex", "config.toml"), join(cwd, ".codex", "config.toml")];
     case "plugins":
       return [join(home, ".claude", "plugins", "installed_plugins.json")];
+    case "cmux":
+      // Present only while cmux runs, so starting or quitting it re-indexes.
+      return [cmuxSocketPath()];
     default:
       return [];
   }
@@ -98,6 +102,7 @@ export async function resolveConfig(cwd = process.cwd()): Promise<ResolvedConfig
     vscode: () => loadVscode(cwd),
     codex: () => loadCodex(cwd),
     plugins: () => loadPluginServers(),
+    cmux: () => loadCmux(),
   };
   for (const name of config.import) {
     const load = loaders[name];
