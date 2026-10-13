@@ -9,6 +9,7 @@ import type {
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { homeDir } from "../util/paths.ts";
+import { describeNetworkError } from "../util/net.ts";
 
 /**
  * Many of the most expensive MCP servers — Datadog, Supabase, Linear — carry no
@@ -330,7 +331,10 @@ export function authHint(server: string, err: unknown): string {
     err instanceof NeedsLoginError ||
     err instanceof UnauthorizedError ||
     /\b401\b|unauthoriz|invalid_token|invalid_grant|requires authorization/i.test(message);
-  return unauthorized ? `needs authorization — run: autorouter login ${server}` : message;
+  if (unauthorized) return `needs authorization — run: autorouter login ${server}`;
+  // Not an auth problem, but "fetch failed" is no more actionable than a 401
+  // was, so the transport failure gets the same treatment where we can name it.
+  return describeNetworkError(err) ?? message;
 }
 
 /**
