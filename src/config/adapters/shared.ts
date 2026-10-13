@@ -12,6 +12,8 @@ export type RawServer = {
   type?: string;
   transport?: string;
   disabled?: boolean;
+  /** Codex's spelling, which `adopt` copies through verbatim. */
+  enabled?: boolean;
   startup_timeout_sec?: number;
   startupTimeoutSec?: number;
 };
@@ -64,7 +66,10 @@ export function normalizeServer(
   origin: string,
 ): ServerEntry | null {
   if (!raw || typeof raw !== "object") return null;
-  const disabled = raw.disabled === true;
+  // Codex writes `enabled = false` rather than `disabled = true`. Reading only
+  // the latter launched every server Codex had switched off — including the
+  // ChatGPT desktop app itself, which the Codex app registers as `cua_repl`.
+  const disabled = raw.disabled === true || raw.enabled === false;
 
   if (raw.url) {
     return {

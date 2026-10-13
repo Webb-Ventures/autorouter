@@ -7,11 +7,24 @@ import type { ServerEntry } from "../../config/types.ts";
 import { backgroundAuth, clearScopeChallenge, recordScopeChallenge } from "../../config/oauth.ts";
 import type { Capability } from "../types.ts";
 import { estimateTokens } from "../types.ts";
+import { regularAppFor } from "../../util/macApp.ts";
+import { serializeRefresh } from "../../config/refresh.ts";
 
 const CLIENT_INFO = { name: "autorouter", version: "0.1.0" };
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 export async function connect(entry: ServerEntry, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<Client> {
+  // Checked here rather than at config time because every path that spawns a
+  // server — serve, re-index, adopt's probe, add — funnels through connect().
+  if (entry.transport === "stdio") {
+    const app = await regularAppFor(entry.command, entry.cwd);
+    if (app) {
+      throw new Error(
+        `not launching ${entry.name}: its command opens the ${app} app rather than starting an MCP server`,
+      );
+    }
+  }
+
   const client = new Client(CLIENT_INFO, { capabilities: {} });
   const transport =
     entry.transport === "http" ? httpTransport(entry) : stdioTransport(entry);
@@ -46,7 +59,7 @@ function httpTransport(entry: Extract<ServerEntry, { transport: "http" }>) {
   const init = {
     ...(entry.headers ? { requestInit: { headers: entry.headers } } : {}),
     authProvider: backgroundAuth(entry.name),
-    fetch: scopeAwareFetch(entry.name),
+    fetch: serializeRefresh(entry.name, scopeAwareFetch(entry.name)),
   };
   return /\/sse\/?$/.test(url.pathname)
     ? new SSEClientTransport(url, init)
