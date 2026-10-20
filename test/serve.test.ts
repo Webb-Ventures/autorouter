@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { mkdtemp, mkdir, writeFile, rm, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -54,6 +54,7 @@ async function connectWithConfig(clientName: string, clientVersion: string) {
       import: [],
       skillPaths: [],
       selector: { mode: "off" },
+      allowAddServer: true,
       servers: { fake: { command: "bun", args: [FIXTURE] } },
     }),
   );
@@ -106,13 +107,39 @@ describe("serve over stdio", () => {
     }
   }, 30_000);
 
-  test("the whole exposed surface stays under 1k tokens", async () => {
+  test("activate_capabilities pins a tool and off: true unpins it", async () => {
+    const { client, cleanup } = await connect("claude-code", "2.1.240");
+    try {
+      const names = async () => (await client.listTools()).tools.map((t) => t.name);
+      expect(await names()).not.toContain("deactivate_capabilities");
+      await client.callTool({ name: "activate_capabilities", arguments: { ids: ["mcp:fake/run_sql_query"] } });
+      expect(await names()).toContain("fake__run_sql_query");
+      await client.callTool({ name: "activate_capabilities", arguments: { off: true } });
+      expect(await names()).not.toContain("fake__run_sql_query");
+    } finally {
+      await cleanup();
+    }
+  }, 30_000);
+
+  test("add_server is opt-in", async () => {
+    const off = await connect("claude-code", "2.1.240");
+    const on = await connect("claude-code", "2.1.240", { allowAddServer: true });
+    try {
+      expect((await off.client.listTools()).tools.map((t) => t.name)).not.toContain("add_server");
+      expect((await on.client.listTools()).tools.map((t) => t.name)).toContain("add_server");
+    } finally {
+      await off.cleanup();
+      await on.cleanup();
+    }
+  }, 30_000);
+
+  test("the whole exposed surface stays under 600 tokens", async () => {
     const { client, cleanup } = await connect("claude-code", "2.1.240");
     try {
       const { tools } = await client.listTools();
       const approx =
         tools.reduce((n, t) => n + JSON.stringify(t).length, 0) + (client.getInstructions() ?? "").length;
-      expect(Math.ceil(approx / 4)).toBeLessThan(1000);
+      expect(Math.ceil(approx / 4)).toBeLessThan(600);
     } finally {
       await cleanup();
     }
@@ -281,7 +308,6 @@ describe("use promotes tools to first-class", () => {
     try {
       const names = (await client.listTools()).tools.map((t) => t.name);
       expect(names).not.toContain("activate_capabilities");
-      expect(names).not.toContain("deactivate_capabilities");
 
       const res: any = await client.callTool({
         name: "call_capability",
@@ -581,4 +607,184 @@ describe("auto-adopt inside a running server", () => {
       await rm(dir, { recursive: true, force: true });
     }
   }, 40_000);
+});
+
+describe("large results", () => {
+  /** Like connect(), but leaves the scratch dir in place until the test is done with it. */
+  async function open(clientName: string, overrides: Record<string, unknown> = {}) {
+    const dir = await mkdtemp(join(tmpdir(), "autorouter-spill-serve-"));
+    const config = join(dir, "autorouter.json");
+    await writeFile(
+      config,
+      JSON.stringify({
+        import: [],
+        skillPaths: [],
+        selector: { mode: "off" },
+        servers: { fake: { command: "bun", args: [FIXTURE] } },
+        ...overrides,
+      }),
+    );
+    const client = new Client({ name: clientName, version: "2.1.240" }, { capabilities: {} });
+    await client.connect(
+      new StdioClientTransport({
+        command: "bun",
+        args: ["run", CLI, "serve"],
+        env: { ...process.env, AUTOROUTER_CONFIG: config, AUTOROUTER_CACHE_DIR: join(dir, "cache"), AUTOROUTER_HOME: dir },
+        stderr: "ignore",
+      }),
+    );
+    return { client, dir, done: async () => rm(dir, { recursive: true, force: true }) };
+  }
+
+  const call = (client: Client, id: string, args: Record<string, unknown> = {}) =>
+    client.callTool({ name: "call_capability", arguments: { id, arguments: args } }) as Promise<any>;
+
+  test("a 2,000-row result comes back as a card pointing at a private JSONL file", async () => {
+    const { client, dir, done } = await open("claude-code");
+    try {
+      const res = await call(client, "mcp:fake/export_rows");
+      expect(res.isError).toBeFalsy();
+      expect(res.content[0].text).toBe("[fake/export_rows]");
+      const card = res.content[1].text as string;
+      expect(card).toContain("2,000 rows, one JSON object per line");
+      // The card is the whole point: a few hundred tokens instead of ~60k.
+      expect(tokensOf(res)).toBeLessThan(1000);
+      const path = /file:\s+(\S+)/.exec(card)![1]!;
+      expect(path.startsWith(join(dir, "cache", "results"))).toBe(true);
+      expect((await readFile(path, "utf8")).trimEnd().split("\n")).toHaveLength(2000);
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+
+      // The session's results go when the client hangs up.
+      await client.close();
+      await Bun.sleep(500);
+      await expect(stat(path)).rejects.toThrow();
+    } finally {
+      await done();
+    }
+  }, 30_000);
+
+  test("structuredContent is dropped when the result is saved, and images pass through", async () => {
+    const { client, done } = await open("claude-code");
+    try {
+      const structured = await call(client, "mcp:fake/structured_rows");
+      expect(structured.structuredContent).toBeUndefined();
+      expect(structured.content[1].text).toContain("from .data");
+
+      const mixed = await call(client, "mcp:fake/rows_and_image");
+      expect(mixed.content.some((c: any) => c.type === "image")).toBe(true);
+      expect(mixed.content.some((c: any) => c.type === "text" && c.text.includes("2,000 rows"))).toBe(true);
+    } finally {
+      await client.close();
+      await done();
+    }
+  }, 30_000);
+
+  test("a Supabase-wrapped result keeps its untrusted-data warning", async () => {
+    const { client, done } = await open("claude-code");
+    try {
+      const res = await call(client, "mcp:fake/wrapped_rows");
+      const card = res.content[1].text as string;
+      expect(card).toContain("2,000 rows");
+      expect(card).toContain("Untrusted data:");
+    } finally {
+      await client.close();
+      await done();
+    }
+  }, 30_000);
+
+  test("a client with no file tools pages through call_capability instead", async () => {
+    const { client, dir, done } = await open("claude-ai");
+    try {
+      const first = await call(client, "mcp:fake/export_rows");
+      const text = first.content[1].text as string;
+      expect(text).toContain("too large to inline");
+      const handle = /result:([0-9a-f]{8})/.exec(text)![1]!;
+      const offset = Number(/offset: (\d+)/.exec(text)![1]);
+      const next = await call(client, `result:${handle}`, { offset });
+      expect(next.isError).toBeFalsy();
+      expect(next.content[0].text).toContain("Showing characters");
+      // Nothing is written in page mode.
+      await expect(stat(join(dir, "cache", "results"))).rejects.toThrow();
+    } finally {
+      await client.close();
+      await done();
+    }
+  }, 30_000);
+
+  test("resultsMode: off inlines everything", async () => {
+    const { client, done } = await open("claude-code", { resultsMode: "off" });
+    try {
+      const res = await call(client, "mcp:fake/export_rows", { count: 200 });
+      expect(JSON.parse(res.content[1].text)).toHaveLength(200);
+    } finally {
+      await client.close();
+      await done();
+    }
+  }, 30_000);
+});
+
+describe("find_capabilities auto", () => {
+  test("runs a clear top hit whose arguments fit, in the same request", async () => {
+    const { client, cleanup } = await connect("claude-code", "2.1.240");
+    try {
+      const res: any = await client.callTool({
+        name: "find_capabilities",
+        arguments: { query: "restart a container", arguments: { name: "api" }, auto: true },
+      });
+      expect(res.content[0].text).toContain("auto-ran mcp:fake/restart_container");
+      expect(JSON.stringify(res.content)).toContain('called restart_container with {\\"name\\":\\"api\\"}');
+    } finally {
+      await cleanup();
+    }
+  }, 30_000);
+
+  test("arguments that do not fit fall back to a normal search, with the reason", async () => {
+    const { client, cleanup } = await connect("claude-code", "2.1.240");
+    try {
+      const res: any = await client.callTool({
+        name: "find_capabilities",
+        arguments: { query: "restart a container", arguments: { name: 7 }, auto: true },
+      });
+      const text = res.content[0].text as string;
+      expect(text).toContain("auto: not run");
+      expect(text).toContain('"name" should be string');
+      expect(text).toContain("mcp:fake/restart_container");
+    } finally {
+      await cleanup();
+    }
+  }, 30_000);
+
+  test("never bypasses a confirm gate", async () => {
+    const { client, cleanup } = await connect("claude-code", "2.1.240", {
+      confirm: ["mcp:fake/restart_container"],
+    });
+    try {
+      const res: any = await client.callTool({
+        name: "find_capabilities",
+        arguments: { query: "restart a container", arguments: { name: "api" }, auto: true },
+      });
+      const text = res.content[0].text as string;
+      expect(text).toContain("auto: not run");
+      expect(text).toContain("requires confirmation");
+      expect(text).not.toContain("called restart_container");
+    } finally {
+      await cleanup();
+    }
+  }, 30_000);
+});
+
+describe("instructions", () => {
+  test("describe the activation mode actually in force", async () => {
+    const lazy = await connect("claude-code", "2.1.240");
+    const off = await connect("claude-code", "2.1.240", { activation: "off" });
+    try {
+      const a = lazy.client.getInstructions() ?? "";
+      expect(a).toContain("first successful call");
+      expect(a).not.toContain("more than once");
+      expect(off.client.getInstructions() ?? "").not.toContain("joins your tool list");
+    } finally {
+      await lazy.cleanup();
+      await off.cleanup();
+    }
+  }, 30_000);
 });

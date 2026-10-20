@@ -8,6 +8,56 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `autorouter audit`: the real context bill, read from Claude Code's
+  transcripts. It uses the usage figures recorded for each call to report:
+  - average context per call, input processed and cache share
+  - compactions, with median size before and after
+  - what fills the window, with each block charged once for every call that
+    re-reads it
+  - which hooks print the most
+  - which MCP servers the harness still calls directly
+
+  It also replays the sessions under a sweep of `autoCompactWindow` values and
+  recommends one. Takes `--days`, `--project` and `--json`.
+- `doctor` reports three costs that adopt can't move:
+  - `SessionStart` hooks whose output lands in context, with the measured
+    median size, and a note when an empty matcher re-runs them after every
+    compaction.
+  - `CLAUDE.md` / `AGENTS.md` lines that name `mcp__<server>__<tool>` for a
+    server now behind the router, with the `call_capability` id to use
+    instead.
+  - Servers injected on the harness command line (`--mcp-config`, for
+    example cmux's `cmux-cua`), flagged when the router imports them too.
+- Large results are saved instead of inlined. A tool or resource result over
+  `spillOverTokens` (default 3,000) is written to a private per-session
+  directory under the cache and replaced by a card with the path, row count,
+  field types, sample rows and a ready-made `jq` filter. Rows are saved as
+  JSONL; Supabase's untrusted-data wrapper is unwrapped and its warning kept.
+  Clients without file tools page through the result with
+  `call_capability({ id: "result:<handle>" })` instead. New settings:
+  `spillOverTokens`, `spillOverrides`, `resultsMode`, `resultsDir`.
+  `init --target claude` offers a `Read` allow rule for the results directory.
+- `find_capabilities` takes optional `arguments` and `auto: true` to search and
+  run in one request when the top hit is a clear winner and the arguments fit
+  its schema. It never bypasses a `confirm` gate.
+- Repo-aware pick-up. The router follows the host's workspace (MCP
+  `roots/list`, then `CLAUDE_PROJECT_DIR`, then its cwd) and routes that repo's
+  `.mcp.json` servers and project skills — from the working directory up to
+  the git root, plus nested `<subdir>/.claude/skills` that Claude Code only
+  loads on demand. They are hidden from Claude Code through the repo's own,
+  git-ignored `.claude/settings.local.json` (`disabledMcpjsonServers`,
+  `skillOverrides`), never by editing a committed file. On by default;
+  disable with `"autoAdoptProject": false`. `adopt --project [dir]` and
+  `restore --project [dir]` do the same by hand, and restore removes only
+  what autorouter added.
+- `autorouter approve [server…]`: let the router launch a repo's `.mcp.json`
+  stdio servers. The approval pins the exact command.
+- `autorouter repair [--apply]`: puts back repo servers that earlier versions
+  of adopt moved out of a committed `.mcp.json` into the global router config
+  (byte-for-byte from the adopt backup when possible), scopes private project
+  servers to their project, and adopts each repo the new way. Dry run by
+  default.
+
 - `autorouter update`: upgrade in place via the package manager that installed
   the running copy, detected from where that copy sits on disk rather than from
   `PATH` — npm/pnpm/yarn/bun, global or as a project dependency. `--check`
@@ -40,6 +90,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The router's own surface is shorter: server instructions 196 → 85 tokens,
+  and tools plus instructions ~1,010 → ~480 on a live catalog.
+  - `deactivate_capabilities` is folded into `activate_capabilities({ ids, off:
+    true })`. The old name is still answered, just not listed.
+  - `add_server` is off by default (`"allowAddServer": true` turns it back on);
+    `autorouter add` covers the same ground without a permanent tool definition.
+  - `find_capabilities` names the catalog's servers but drops the counts.
+  - Slash commands without an `argument-hint` no longer carry a placeholder
+    argument description.
+- `init --target claude` no longer writes a primer into `~/.claude/CLAUDE.md`
+  and removes one an older version wrote. Claude Code already injects the
+  server's instructions into every request, so the primer said everything
+  twice. Other harnesses keep a shorter primer.
+
+### Fixed
+
+- `adopt` and auto-adopt no longer edit committed project files
+  (`.mcp.json`, `.cursor/mcp.json`, `.vscode/mcp.json`). They used to empty a
+  repo's `.mcp.json` — a diff for the whole team — and move its servers into
+  the router's global config, making them reachable from every project.
+  Private per-project servers (`~/.claude.json` `projects[path]`) now move to
+  the router's `projects[path]` section instead of the global list.
+- `adopt` no longer writes project skills into user-level `skillOverrides`,
+  where the bare-name override hid a same-named skill in every repo.
+
+### Security
+
+- A repo's `.mcp.json` servers are only indexed (and launched) when Claude Code
+  would run them: the folder is trusted, and the server is HTTP or approved —
+  in Claude Code, or with `autorouter approve`. Previously the router launched
+  any `.mcp.json` stdio command in whatever directory it started in.
+
+### Changed
+
 - `autorouter login` reindexes automatically once a new grant is stored, so a
   freshly authorized server is searchable without a second command.
   `--no-reindex` skips it. Only a login that actually stores a grant triggers
@@ -61,6 +145,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The server instructions said a tool is promoted after being called "more than
+  once". Lazy activation promotes after the first successful call, and eager and
+  off behave differently again; the instructions now describe the mode in force.
 - Servers switched off with Codex's `enabled = false` are no longer launched.
   Only `disabled: true` was honoured, so the ChatGPT desktop app — which the
   Codex app registers as the `cua_repl` server — opened on every restart and

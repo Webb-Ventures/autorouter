@@ -1,9 +1,9 @@
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { ensureDir, readText, writeText } from "../util/fs.ts";
 import { homeDir, stripJsonComments } from "../util/paths.ts";
 import { resolveConfig } from "../config/resolve.ts";
-import { upsertServers } from "../config/write.ts";
+import { upsertProjectServers, upsertServers } from "../config/write.ts";
 import type { Harness } from "./init.ts";
 import {
   applyExtras,
@@ -38,7 +38,8 @@ export type AdoptResult = {
   notes: string[];
 };
 
-type JsonSite = { file: string; section: string; path: string[] };
+/** `project` marks a section that belongs to one repo, so its servers stay scoped to it. */
+type JsonSite = { file: string; section: string; path: string[]; project?: string };
 
 export async function runAdopt(opts: {
   harness: Harness;
@@ -63,12 +64,14 @@ export async function runAdopt(opts: {
 
   const plans: AdoptPlan[] = [];
   const adopted: Record<string, any> = {};
+  /** Servers from a project-scoped section, bound for config.projects[root]. */
+  const adoptedProject: Record<string, any> = {};
   /** Original file text, captured before anything is mutated. */
   const backup: Record<string, string> = {};
   /** Parsed, mutated document per file — one entry even when a file has two sections. */
   const docs = new Map<string, any>();
 
-  const apply = (site: AdoptPlan, entries: Record<string, any>) => {
+  const apply = (site: AdoptPlan, entries: Record<string, any>, target = adopted) => {
     for (const [name, spec] of Object.entries(entries)) {
       if (keep.has(name)) {
         site.kept.push(name);
@@ -76,7 +79,7 @@ export async function runAdopt(opts: {
       }
       site.moved.push(name);
       // First writer wins: the same server registered twice is one server.
-      adopted[name] ??= spec;
+      target[name] ??= spec;
       delete entries[name];
     }
   };
@@ -123,7 +126,7 @@ export async function runAdopt(opts: {
         moved: [],
         kept: [],
       };
-      apply(plan, container);
+      apply(plan, container, site.project ? adoptedProject : adopted);
       plans.push(plan);
     }
   }
@@ -140,6 +143,7 @@ export async function runAdopt(opts: {
     ...resolved.servers.map((s) => s.name),
     ...resolved.servers.flatMap((s) => (s.name.includes(":") ? [s.name.split(":").pop()!] : [])),
     ...Object.keys(adopted),
+    ...Object.keys(adoptedProject),
   ]);
 
   const extras =
@@ -189,7 +193,10 @@ export async function runAdopt(opts: {
     );
   }
 
-  if (movedCount) await upsertServers(adopted, { configPath: resolved.configPath });
+  if (Object.keys(adopted).length) await upsertServers(adopted, { configPath: resolved.configPath });
+  if (Object.keys(adoptedProject).length) {
+    await upsertProjectServers(resolve(opts.cwd), adoptedProject, { configPath: resolved.configPath });
+  }
   if (extras && extrasCount) await applyExtras(extras);
 
   const notes: string[] = [];
@@ -272,6 +279,16 @@ export async function runRestore(harness: Harness): Promise<string[]> {
   return notes;
 }
 
+/**
+ * The harness config sections adopt may rewrite.
+ *
+ * Only files private to this user. A repo's `.mcp.json`, `.cursor/mcp.json` and
+ * `.vscode/mcp.json` are committed: emptying them shows up as a diff for the
+ * whole team, and moving their servers into the router's global config made a
+ * repo's servers reachable from every other project. Project `.mcp.json`
+ * servers are picked up in place instead (workspace/project.ts), and hidden
+ * from Claude Code through the repo's own settings.local.json.
+ */
 function jsonSites(harness: Harness, cwd: string): JsonSite[] {
   switch (harness) {
     case "claude":
@@ -281,18 +298,16 @@ function jsonSites(harness: Harness, cwd: string): JsonSite[] {
           file: join(homeDir(), ".claude.json"),
           section: `projects[${cwd}].mcpServers`,
           path: ["projects", cwd, "mcpServers"],
+          project: cwd,
         },
-        { file: join(cwd, ".mcp.json"), section: "mcpServers", path: ["mcpServers"] },
       ];
     case "cursor":
       return [
         { file: join(homeDir(), ".cursor", "mcp.json"), section: "mcpServers", path: ["mcpServers"] },
-        { file: join(cwd, ".cursor", "mcp.json"), section: "mcpServers", path: ["mcpServers"] },
       ];
     case "vscode":
       return [
         { file: join(homeDir(), ".vscode", "mcp.json"), section: "servers", path: ["servers"] },
-        { file: join(cwd, ".vscode", "mcp.json"), section: "servers", path: ["servers"] },
       ];
     default:
       return [];

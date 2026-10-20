@@ -8,6 +8,12 @@ export type Capability = {
   name: string;
   /** Owning MCP server or plugin, when there is one. */
   server?: string;
+  /**
+   * For skills: whose it is. Project skills are hidden per repo (in that repo's
+   * settings.local.json), never in user settings, where the bare-name override
+   * would hide a same-named skill in every project.
+   */
+  origin?: "user" | "project" | "plugin";
   title?: string;
   description: string;
   keywords: string[];
@@ -49,8 +55,10 @@ export type Catalog = {
  * 5: `refresh()` used to rebuild from the config resolved at startup, so any
  *    server registered while a `serve` process was running was written out of
  *    the catalog and then cached as current.
+ * 6: skills gained `origin`, and unapproved `.mcp.json` servers used to be
+ *    indexed (and launched) from any repo the router started in.
  */
-export const CATALOG_VERSION = 5;
+export const CATALOG_VERSION = 6;
 
 /** ~4 chars/token is close enough for a budget estimate. */
 export function estimateTokens(...parts: Array<string | unknown>): number {

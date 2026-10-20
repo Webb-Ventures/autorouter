@@ -132,9 +132,13 @@ export async function planExtras(opts: {
   }
 
   // Skills the router can see. Plugin skills are covered by the plugin toggle,
-  // and skillOverrides is keyed by bare name anyway, so only user skills here.
+  // and skillOverrides is keyed by bare name, so only user skills belong in
+  // user settings: a project skill hidden here would hide every same-named
+  // skill in every repo. Project skills are hidden per repo instead
+  // (workspace/project.ts).
   const { capabilities } = await collectSkills(opts.skillPaths, opts.cwd, { includePlugins: true });
   for (const cap of capabilities) {
+    if (cap.origin === "project") continue;
     if (cap.server && (disabledPluginNames.has(cap.server) || untouched.has(cap.server))) continue;
     if (keepSkills.has(cap.name)) continue;
     const current = settings.skillOverrides?.[cap.name];

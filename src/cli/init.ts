@@ -3,7 +3,9 @@ import { createInterface } from "node:readline/promises";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { ensureDir, readText, writeText } from "../util/fs.ts";
 import { suggestModel } from "../selector/backends.ts";
-import { homeDir } from "../util/paths.ts";
+import { homeDir, stripJsonComments } from "../util/paths.ts";
+import { resolveConfig } from "../config/resolve.ts";
+import { ResultStore } from "../server/spill.ts";
 
 export type Harness = "claude" | "codex" | "cursor" | "vscode";
 
@@ -56,7 +58,64 @@ export async function runInit(opts: {
   }
 
   notes.push(await writePrimer(opts.harness));
+  if (opts.harness === "claude") notes.push(await offerResultsReadRule(Boolean(opts.yes)));
   return notes;
+}
+
+/**
+ * Large tool results are saved under the router's cache, outside any project,
+ * so Claude Code asks permission for every Read of one. An allow rule for that
+ * one directory removes the prompt without widening anything else.
+ *
+ * Asked, never assumed: a permission rule is the user's to grant. Without a
+ * terminal (or with --yes) the rule is printed rather than written.
+ */
+async function offerResultsReadRule(yes: boolean): Promise<string> {
+  const resolved = await resolveConfig(process.cwd());
+  const dir = new ResultStore(resolved.config, resolved.cwd).rootDir;
+  const rule = `Read(${readRulePath(dir)}/**)`;
+  const path = join(homeDir(), ".claude", "settings.json");
+  const text = (await readText(path)) ?? "{}";
+  let settings: any;
+  try {
+    settings = JSON.parse(stripJsonComments(text));
+  } catch {
+    return `Could not parse ${path}; to skip Read prompts for saved results, add "${rule}" to permissions.allow.`;
+  }
+  const allow: string[] = Array.isArray(settings?.permissions?.allow) ? settings.permissions.allow : [];
+  if (allow.includes(rule)) return `Saved results are already readable without a prompt (${rule}).`;
+
+  const suggestion = `To skip the Read prompt for large saved results, add "${rule}" to permissions.allow in ${path}.`;
+  if (yes || !process.stdin.isTTY) return suggestion;
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  let answer: string;
+  try {
+    answer = (
+      await rl.question(
+        `\nLarge tool results are saved under ${dir}.\nLet Claude Code read them without asking each time? Adds ${rule} [Y/n]: `,
+      )
+    ).trim().toLowerCase();
+  } finally {
+    rl.close();
+  }
+  if (answer && answer !== "y" && answer !== "yes") return suggestion;
+
+  settings.permissions ??= {};
+  settings.permissions.allow = [...allow, rule];
+  await ensureDir(join(path, ".."));
+  await writeText(path, `${JSON.stringify(settings, null, 2)}\n`);
+  return `Allowed Claude Code to read saved results: ${rule} in ${path}`;
+}
+
+/**
+ * Claude Code reads `~/x` as home-relative and `//x` as an absolute path; a
+ * single leading slash would be taken relative to the settings file.
+ */
+export function readRulePath(dir: string): string {
+  const home = homeDir();
+  if (dir === home || dir.startsWith(`${home}/`)) return `~${dir.slice(home.length)}`;
+  return `/${dir}`;
 }
 
 async function writeJsonServer(
@@ -111,6 +170,10 @@ async function writeCodexServer(
  * Each harness reads persistent guidance from a different file. Without a
  * primer the model has no reason to search before concluding a task is
  * impossible, which is the main failure mode of a router.
+ *
+ * Claude Code is the exception: it injects the server's own instructions into
+ * every request, so a primer there says the same thing twice on every call.
+ * An existing block from an older init is removed instead.
  */
 async function writePrimer(harness: Harness): Promise<string> {
   const targets: Record<Harness, string> = {
@@ -123,6 +186,7 @@ async function writePrimer(harness: Harness): Promise<string> {
   await ensureDir(join(path, ".."));
 
   const current = (await readText(path)) ?? "";
+  if (harness === "claude") return await removePrimer(path, current);
   const section =
     harness === "cursor"
       ? `---\ndescription: Capability router\nalwaysApply: true\n---\n\n${PRIMER}`
@@ -143,21 +207,29 @@ async function writePrimer(harness: Harness): Promise<string> {
   return `Added router primer to ${path}`;
 }
 
+const PRIMER_BLOCK = /\n*<!-- autorouter -->[\s\S]*?<!-- \/autorouter -->\n?/;
+
+/** The text without the router's primer block, or null when there is none. */
+export function stripPrimer(text: string): string | null {
+  if (!PRIMER_BLOCK.test(text)) return null;
+  const next = text.replace(PRIMER_BLOCK, "\n").replace(/\n{3,}$/, "\n");
+  return next.trim() ? next : "";
+}
+
+async function removePrimer(path: string, current: string): Promise<string> {
+  const next = stripPrimer(current);
+  if (next === null) return "No primer needed: Claude Code reads the router's server instructions";
+  await writeText(path, next);
+  return `Removed the router primer from ${path}: Claude Code reads the router's server instructions`;
+}
+
 const PRIMER = `<!-- autorouter -->
 ## Capability router
 
-Most tools, skills and commands on this machine are not in your tool list. They
-are behind \`find_capabilities\`.
-
-Before deciding a task cannot be done, or reaching for a manual workaround, call
-\`find_capabilities({ query: "<what you are trying to do>" })\`. It searches every
-configured MCP server, skill and plugin command and returns only what fits.
-Then \`describe_capability\` for the schema, and \`call_capability\` to run it.
-
-To install a new MCP server, use the router's \`add_server\` tool, or run
-\`autorouter add <name> --url <url>\` / \`autorouter add <name> -- <command>\`.
-Do not run \`claude mcp add\` — that loads the server's whole tool list into
-context, which is what the router is here to avoid.
+Most tools, skills and MCP servers are behind \`find_capabilities\`: search it by
+goal before deciding a task can't be done, then run a hit with
+\`call_capability\`. Install MCP servers with \`autorouter add\`, not the harness's
+own command, which loads every tool into context.
 <!-- /autorouter -->`;
 
 async function promptModel(harness: Harness, suggested: string | null): Promise<string | null> {

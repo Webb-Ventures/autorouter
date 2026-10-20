@@ -3,6 +3,7 @@ import { Router, CapabilityError } from "./router.ts";
 import { serve } from "./server/index.ts";
 import { runInit, type Harness } from "./cli/init.ts";
 import { runDoctor } from "./cli/doctor.ts";
+import { runAudit } from "./cli/audit.ts";
 import { runAdopt, runRestore } from "./cli/adopt.ts";
 import { runAdd, runRemove } from "./cli/add.ts";
 import { runLogin, summarizeScopes } from "./cli/login.ts";
@@ -13,6 +14,9 @@ import { renderCapability, renderRouteResult, oneLine } from "./server/render.ts
 import type { CapabilityKind } from "./catalog/types.ts";
 import { loadCatalog } from "./catalog/build.ts";
 import { tuneConnectionRacing } from "./util/net.ts";
+import { absPath } from "./util/paths.ts";
+import { workspaceRoot } from "./workspace/root.ts";
+import { cmdAdoptProject, cmdApprove, cmdRepair, cmdRestoreProject, projectFlag } from "./cli/project.ts";
 
 const VERSION = "0.1.0";
 
@@ -25,6 +29,10 @@ const USAGE = `autorouter — one search tool instead of every tool
   autorouter list [--kind K]           List everything in the catalog
   autorouter reindex                   Rebuild the catalog now
   autorouter doctor                    Show what is reachable and what it saves
+  autorouter audit                     The real context bill from Claude Code
+                                       transcripts: what fills the window, and
+                                       the compaction window that costs least.
+                                       --days N, --project DIR, --json
   autorouter update                    Upgrade via the package manager that
                                        installed this copy. --check to look
                                        without installing.
@@ -43,6 +51,15 @@ const USAGE = `autorouter — one search tool instead of every tool
                                        removes them from context. --dry-run to
                                        preview.
   autorouter restore --target <harness> Undo the most recent adopt
+  autorouter adopt --project [dir]     Route this repo's .mcp.json servers and
+                                       skills, hiding them from Claude Code via
+                                       its settings.local.json. serve does this
+                                       automatically for the repo it runs in.
+  autorouter restore --project [dir]   Take back exactly what that added
+  autorouter approve [server...]       Let the router launch these .mcp.json
+                                       stdio servers (default: all unapproved)
+  autorouter repair [--apply]          Put back repo servers that older adopt
+                                       versions moved into the global config
 
 Options
   --raw          search: skip the selector model, show index ranking
@@ -53,7 +70,11 @@ Options
   --server S     restrict to one provider
   --limit N      max results
   --json         machine-readable output
+  --days N       audit: only transcripts modified in the last N days (default 14)
   --yes          init/adopt: do not prompt
+  --project [D]  adopt/restore/approve: act on repo D (default: current dir)
+                 audit: only sessions started in D
+  --apply        repair: make the changes (default is a dry run)
   --dry-run      adopt: show what would move, change nothing
                  update: print the upgrade command without running it
   --check        update: report the available version, install nothing
@@ -79,7 +100,9 @@ Options
 
 \`add\` registers behind the router, so a new server never enters your context.
 Servers added to a harness the normal way (\`claude mcp add\`) are moved behind
-it automatically; set "autoAdopt": false to keep that manual.
+it automatically; set "autoAdopt": false to keep that manual. A repo's own
+.mcp.json servers and .claude/skills are routed for that repo only, without
+editing anything committed; set "autoAdoptProject": false to keep that manual.
 
 Servers like Datadog and Supabase hold no credentials in their config — the
 working token is an OAuth grant the harness keeps privately. The router obtains
@@ -97,7 +120,9 @@ async function main(argv: string[]): Promise<number> {
   switch (command) {
     case undefined:
     case "serve":
-      await serve({ cwd: process.cwd() });
+      // CLAUDE_PROJECT_DIR beats the spawn cwd; roots/list, once the host
+      // answers it, beats both (see serve()).
+      await serve({ cwd: workspaceRoot() });
       return 0;
 
     case "search":
@@ -119,6 +144,13 @@ async function main(argv: string[]): Promise<number> {
     case "doctor":
       console.log(await runDoctor(process.cwd()));
       return 0;
+
+    case "audit": {
+      const days = flags.days === "all" ? undefined : (num(flags.days) ?? 14);
+      const project = typeof flags.project === "string" && flags.project ? absPath(flags.project) : undefined;
+      console.log(await runAudit({ days, project, json: Boolean(flags.json) }));
+      return 0;
+    }
 
     case "update":
     case "upgrade": {
@@ -148,10 +180,21 @@ async function main(argv: string[]): Promise<number> {
     case "rm":
       return await cmdRemove(positionals[0]);
 
-    case "adopt":
+    case "adopt": {
+      const root = projectFlag(flags);
+      if (root) return await cmdAdoptProject(root, Boolean(flags["dry-run"]));
       return await cmdAdopt(flags);
+    }
+
+    case "approve":
+      return await cmdApprove(positionals, flags);
+
+    case "repair":
+      return await cmdRepair(flags);
 
     case "restore": {
+      const root = projectFlag(flags);
+      if (root) return await cmdRestoreProject(root);
       const harness = flags.target as Harness;
       if (!harness) {
         console.error("--target is required: claude|codex|cursor|vscode");
@@ -635,7 +678,7 @@ function parseArgs(argv: string[]): {
       // carries the pasted server snippet for `add`. Resolving that by command
       // keeps the flag named the way the vendor docs people copy from name it.
       const boolean =
-        ["raw", "json", "yes", "dry-run", "force", "servers-only", "read-only", "all-scopes", "list-scopes", "device", "manual", "check", "no-reindex"].includes(name) &&
+        ["raw", "json", "yes", "dry-run", "force", "servers-only", "read-only", "all-scopes", "list-scopes", "device", "manual", "check", "no-reindex", "apply"].includes(name) &&
         !(name === "json" && command === "add");
       if (boolean) {
         flags[name] = true as any;

@@ -86,12 +86,38 @@ describe("adopt", () => {
     expect(await readFile(join(home, ".claude.json"), "utf8")).toBe(before);
   });
 
-  test("moved servers land in the router's own config", async () => {
+  test("moved servers land in the router's own config, project ones scoped to their project", async () => {
     await writeClaudeConfig(dir);
     await runAdopt({ harness: "claude", cwd: dir, keep: [], dryRun: false });
     const routerCfg = JSON.parse(await readFile(join(dir, "autorouter.json"), "utf8"));
-    expect(Object.keys(routerCfg.servers).sort()).toEqual(["linear", "railway"]);
+    expect(Object.keys(routerCfg.servers).sort()).toEqual(["railway"]);
     expect(routerCfg.servers.railway.args).toEqual(["@railway/mcp"]);
+    // A server registered for one project must not become reachable from every other.
+    expect(Object.keys(routerCfg.projects[dir].servers)).toEqual(["linear"]);
+  });
+
+  test("never edits a committed .mcp.json", async () => {
+    await writeClaudeConfig(dir);
+    const mcpjson = JSON.stringify({ mcpServers: { stripe: { type: "http", url: "https://mcp.stripe.com/" } } }, null, 2);
+    await writeFile(join(dir, ".mcp.json"), mcpjson);
+    await runAdopt({ harness: "claude", cwd: dir, keep: [], dryRun: false });
+    await runAutoAdopt(dir);
+    expect(await readFile(join(dir, ".mcp.json"), "utf8")).toBe(mcpjson);
+    const routerCfg = JSON.parse(await readFile(join(dir, "autorouter.json"), "utf8"));
+    expect(routerCfg.servers.stripe).toBeUndefined();
+  });
+
+  test("never edits committed cursor or vscode project configs", async () => {
+    const cursor = JSON.stringify({ mcpServers: { a: { command: "x" } } });
+    const vscode = JSON.stringify({ servers: { b: { command: "y" } } });
+    await mkdir(join(dir, ".cursor"), { recursive: true });
+    await mkdir(join(dir, ".vscode"), { recursive: true });
+    await writeFile(join(dir, ".cursor", "mcp.json"), cursor);
+    await writeFile(join(dir, ".vscode", "mcp.json"), vscode);
+    await runAdopt({ harness: "cursor", cwd: dir, keep: [], dryRun: false });
+    await runAdopt({ harness: "vscode", cwd: dir, keep: [], dryRun: false });
+    expect(await readFile(join(dir, ".cursor", "mcp.json"), "utf8")).toBe(cursor);
+    expect(await readFile(join(dir, ".vscode", "mcp.json"), "utf8")).toBe(vscode);
   });
 
   test("restore puts the harness config back byte for byte", async () => {

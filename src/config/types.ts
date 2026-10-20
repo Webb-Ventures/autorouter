@@ -22,6 +22,15 @@ export type ServerEntry = ServerSpec & {
   disabled?: boolean;
 };
 
+export type RawServerConfig = Partial<ServerSpec> & {
+  command?: string;
+  args?: string[];
+  url?: string;
+  disabled?: boolean;
+  enabled?: boolean;
+  env?: Record<string, string>;
+};
+
 export type SelectorConfig = {
   /**
    * "auto"    - MCP sampling if the host supports it, else the harness's own
@@ -62,7 +71,15 @@ export type RouterConfig = {
   /** Harness configs to import servers from. */
   import: string[];
   /** Extra servers declared directly. */
-  servers: Record<string, Partial<ServerSpec> & { command?: string; args?: string[]; url?: string; disabled?: boolean; enabled?: boolean; env?: Record<string, string> }>;
+  servers: Record<string, RawServerConfig>;
+  /**
+   * Servers that belong to one project, keyed by its absolute path.
+   *
+   * Adoption moves a project's private servers (Claude Code's
+   * projects[<path>].mcpServers) here rather than into `servers`, so a server
+   * registered for one repo is not suddenly reachable from every other.
+   */
+  projects?: Record<string, { servers?: Record<string, RawServerConfig> }>;
   skillPaths: string[];
   /** Capability id globs that are never surfaced. */
   exclude: string[];
@@ -107,6 +124,13 @@ export type RouterConfig = {
    * skills and plugins are never touched unprompted.
    */
   autoAdopt: boolean;
+  /**
+   * Pick up the skills and `.mcp.json` servers of whichever repo the session is
+   * in, and hide them from Claude Code through that repo's private
+   * `.claude/settings.local.json`. Never edits a committed file, and only takes
+   * `.mcp.json` servers Claude Code would itself run (see workspace/trust.ts).
+   */
+  autoAdoptProject: boolean;
   /** Expose the add_server tool, letting the model register a server mid-session. */
   allowAddServer: boolean;
   selector: SelectorConfig;
@@ -115,6 +139,27 @@ export type RouterConfig = {
   lexicalWeight: number;
   /** Seconds before the on-disk catalog is considered stale. */
   cacheTtlSec: number;
+  /**
+   * Tool and resource results over this many tokens are not inlined.
+   *
+   * An inlined result is context for the rest of the session — re-read on
+   * every later turn until compaction. Past this size the router saves it and
+   * returns a short card (path, shape, sample rows) the model queries instead.
+   */
+  spillOverTokens: number;
+  /** Per-capability thresholds keyed by id glob, e.g. {"mcp:linear/*": 8000}. 0 never spills. */
+  spillOverrides: Record<string, number>;
+  /** Where saved results go. Empty means <cache>/results. Never inside the working tree. */
+  resultsDir: string;
+  /**
+   * How an oversized result is handed back.
+   *
+   * "file" - saved to resultsDir; the model greps/reads the file.
+   * "page" - held in memory; fetched with call_capability({ id: "result:<handle>" }).
+   * "auto" - file when the client is known to have file tools, else page.
+   * "off"  - always inline, whatever the size.
+   */
+  resultsMode: "auto" | "file" | "page" | "off";
 };
 
 export const DEFAULT_CONFIG: RouterConfig = {
@@ -127,7 +172,8 @@ export const DEFAULT_CONFIG: RouterConfig = {
   promptMode: "commands",
   activation: "lazy",
   autoAdopt: true,
-  allowAddServer: true,
+  autoAdoptProject: true,
+  allowAddServer: false,
   selector: {
     mode: "auto",
     candidates: 30,
@@ -137,4 +183,8 @@ export const DEFAULT_CONFIG: RouterConfig = {
   embeddings: { provider: "none" },
   lexicalWeight: 0.5,
   cacheTtlSec: 60 * 60 * 6,
+  spillOverTokens: 3000,
+  spillOverrides: {},
+  resultsDir: "",
+  resultsMode: "auto",
 };

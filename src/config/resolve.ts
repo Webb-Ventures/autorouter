@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DEFAULT_CONFIG, type RouterConfig, type ServerEntry } from "./types.ts";
 import { homeDir, absPath, readJson } from "../util/paths.ts";
 import { loadClaude } from "./adapters/claude.ts";
@@ -7,6 +7,7 @@ import { loadCodex } from "./adapters/codex.ts";
 import { loadPluginServers } from "./adapters/plugins.ts";
 import { cmuxSocketPath, loadCmux } from "./adapters/cmux.ts";
 import { isSelfReference, normalizeServer, specKey } from "./adapters/shared.ts";
+import { mainCheckout } from "../workspace/trust.ts";
 
 export type ResolvedConfig = {
   config: RouterConfig;
@@ -32,7 +33,16 @@ function harnessSources(name: string, cwd: string): string[] {
   const home = homeDir();
   switch (name) {
     case "claude":
-      return [join(home, ".claude.json"), join(cwd, ".mcp.json")];
+      // The settings files carry .mcp.json approvals, so they gate which
+      // project servers are indexed and have to invalidate the catalog too.
+      return [
+        join(home, ".claude.json"),
+        join(cwd, ".mcp.json"),
+        join(home, ".claude", "settings.json"),
+        join(cwd, ".claude", "settings.json"),
+        join(cwd, ".claude", "settings.local.json"),
+        join(home, ".autorouter", "approvals.json"),
+      ];
     case "cursor":
       return [join(home, ".cursor", "mcp.json"), join(cwd, ".cursor", "mcp.json")];
     case "vscode":
@@ -90,6 +100,7 @@ export async function resolveConfig(cwd = process.cwd()): Promise<ResolvedConfig
     selector: { ...DEFAULT_CONFIG.selector, ...pruneUndefined(user?.selector) },
     embeddings: { ...DEFAULT_CONFIG.embeddings, ...pruneUndefined(user?.embeddings) },
     servers: { ...user?.servers },
+    spillOverrides: { ...user?.spillOverrides },
   };
 
   applyEnvOverrides(config);
@@ -117,6 +128,13 @@ export async function resolveConfig(cwd = process.cwd()): Promise<ResolvedConfig
 
   for (const [name, raw] of Object.entries(config.servers)) {
     const entry = normalizeServer(name, raw as any, "config");
+    if (entry) imported.push(entry);
+  }
+  // A project's servers also serve its linked worktrees (same repository).
+  const main = await mainCheckout(cwd);
+  const projectServers = { ...config.projects?.[main]?.servers, ...config.projects?.[resolve(cwd)]?.servers };
+  for (const [name, raw] of Object.entries(projectServers)) {
+    const entry = normalizeServer(name, raw as any, "config:project");
     if (entry) imported.push(entry);
   }
 
@@ -148,11 +166,21 @@ function applyEnvOverrides(config: RouterConfig): void {
     config.activation = env.AUTOROUTER_ACTIVATION as RouterConfig["activation"];
   }
   if (env.AUTOROUTER_AUTO_ADOPT) config.autoAdopt = env.AUTOROUTER_AUTO_ADOPT !== "0";
+  if (env.AUTOROUTER_AUTO_ADOPT_PROJECT) {
+    config.autoAdoptProject = env.AUTOROUTER_AUTO_ADOPT_PROJECT !== "0";
+  }
   if (env.AUTOROUTER_ALLOW_ADD_SERVER) config.allowAddServer = env.AUTOROUTER_ALLOW_ADD_SERVER !== "0";
   if (env.AUTOROUTER_EMBEDDINGS_PROVIDER) {
     config.embeddings.provider = env.AUTOROUTER_EMBEDDINGS_PROVIDER as RouterConfig["embeddings"]["provider"];
   }
   if (env.AUTOROUTER_EMBEDDINGS_MODEL) config.embeddings.model = env.AUTOROUTER_EMBEDDINGS_MODEL;
+  if (env.AUTOROUTER_RESULTS_MODE) {
+    config.resultsMode = env.AUTOROUTER_RESULTS_MODE as RouterConfig["resultsMode"];
+  }
+  if (env.AUTOROUTER_SPILL_OVER_TOKENS) {
+    const n = Number.parseInt(env.AUTOROUTER_SPILL_OVER_TOKENS, 10);
+    if (Number.isFinite(n)) config.spillOverTokens = n;
+  }
 }
 
 /**

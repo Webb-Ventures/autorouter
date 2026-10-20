@@ -44,10 +44,15 @@ describe("catalog", () => {
     expect(tools.map((t) => t.name).sort()).toEqual([
       "bloated_report",
       "explode",
+      "export_rows",
       "list_backups",
+      "long_notes",
       "render_bar_chart",
       "restart_container",
+      "rows_and_image",
       "run_sql_query",
+      "structured_rows",
+      "wrapped_rows",
     ]);
   });
 

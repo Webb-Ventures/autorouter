@@ -79,12 +79,12 @@ Run `autorouter doctor` to see the difference:
 ```
 ## Context cost
   exposing everything: ~87,524 tokens
-  router surface:      ~972 tokens
-  best case:           ~86,552 tokens saved (99%)
+  router surface:      ~752 tokens
+  best case:           ~86,772 tokens saved (99%)
 
   per harness (a session only ever runs in one):
-    codex   still loaded ~35,500 → saves ~51,052 (58%)
-    claude, cursor, vscode: fully adopted → saves ~86,552 (99%)
+    codex   still loaded ~35,500 → saves ~51,272 (59%)
+    claude, cursor, vscode: fully adopted → saves ~86,772 (99%)
 
 ## Not yet adopted
   codex
@@ -97,6 +97,61 @@ than summed: a session runs in exactly one, so a server still registered in Code
 costs a Claude Code session nothing. Every removal is backed up verbatim to
 `~/.autorouter/adopted/` before anything is written;
 `autorouter restore --target claude` puts it back byte for byte.
+
+Doctor also reports what costs context but no `adopt` can move. It only reports
+and suggests; it never edits these:
+
+- **Hooks**: `SessionStart` hooks whose output lands in context, with the
+  median size measured from your transcripts. A hook with an empty matcher runs
+  again after every compaction, `/clear` and resume.
+- **Stale tool references**: lines in `~/.claude/CLAUDE.md`, `CLAUDE.md` or
+  `AGENTS.md` that name a tool as `mcp__<server>__<tool>` when that server now
+  sits behind the router. The model looks for a tool that isn't there.
+  The router's own primer block is skipped.
+- **Injected servers**: servers a launcher passes on the command line
+  (`claude --mcp-config ...`, as cmux does with `cmux-cua`). These are in no
+  config file, so adopt can't move them. Doctor flags them when the router
+  imports a copy as well.
+
+### What a session actually pays: `autorouter audit`
+
+Schemas are only part of the bill. Claude Code already defers MCP schemas to
+names, and every API call re-reads everything still in the window, so the real
+cost is context size × number of calls. `autorouter audit` reads Claude Code's
+transcripts (`~/.claude/projects/*/*.jsonl`) and uses the usage figures recorded
+for each call:
+
+```
+## Context bill
+  avg context per call   181k
+  input processed        4.79B (96% cache reads)
+  compactions            269 (median 317k before → 90k after)
+
+## What fills it (tokens × calls each stays in context)
+   30.1%   1.44B  startup overhead (system prompt, tools, skills, CLAUDE.md)
+   23.2%   1.11B  carried over through compaction (kept turns, re-attached files)
+   15.4%  735.5M  Claude's thinking (kept in context)
+   13.9%  666.0M  Bash output
+   ...
+
+## Compaction window (replay, API-equivalent cost)
+  autoCompactWindow: 350000 (~/.claude/settings.json)
+     window    change  compactions  avg context
+       140k    -26.9%          834         102k
+       170k    -25.9%          559         116k  ← recommended
+       350k      0.0%          173         196k  ← current
+```
+
+Attribution charges each block of content once for every later call that
+re-reads it, until the next compaction. The window table replays your own
+sessions under each `autoCompactWindow`, calibrated against the compactions
+in your transcripts. Costs are weighted by API price ratios (cache read ×0.1,
+cache write ×1.25, output ×5) as a proxy for subscription usage. Read the
+percentages as relative, not exact. Among windows within 1.5 points of the
+cheapest, it recommends the largest, because every compaction loses some
+detail.
+`--days N` (default 14, or `all`) and `--project DIR` narrow the range;
+`--json` prints the full report.
 
 ## How it finds things
 
@@ -183,13 +238,55 @@ skills are searchable but not republished by default, because the prompt list
 that would carry them is permanent context — see [Slash commands](#slash-commands).
 
 Harness configs are imported rather than duplicated: `~/.claude.json` (global and
-per-project) and `.mcp.json`, `~/.codex/config.toml`, `~/.cursor/mcp.json`,
+per-project) and the repo's `.mcp.json` (see [Repo skills and servers](#repo-skills-and-servers)), `~/.codex/config.toml`, `~/.cursor/mcp.json`,
 `~/.vscode/mcp.json`, and installed Claude Code plugins. While the
 cmux terminal is running, its Computer Use server
 (`cmux-cua`) is picked up too, since cmux injects it per session rather than
 writing it to any config. Servers a harness has switched off (`disabled: true`,
 or Codex's `enabled = false`) are skipped, and a command that would just open a
 desktop app — rather than start an MCP server — is never launched.
+
+## Repo skills and servers
+
+Open Claude Code in a repo, or anywhere inside one, and the router picks up that
+repo's `.mcp.json` servers and `.claude/skills` — scoped to it, so they never
+show up in another project — and Claude Code stops pre-loading them.
+
+- **Which repo.** The host's `roots/list` (Claude Code answers with its launch
+  directory and any `--add-dir`s, and announces changes), then
+  `CLAUDE_PROJECT_DIR`, then the router's own working directory.
+- **Which skills.** `.claude/skills` in the working directory and each parent up
+  to the git root, the way Claude Code reads them, plus every nested
+  `<subdir>/.claude/skills` below the root. Claude Code only loads those once it
+  touches a file in that subdirectory; the router can search a monorepo's
+  per-app skills from the top.
+- **How they leave context.** Only through the repo's own, private
+  `.claude/settings.local.json`: `disabledMcpjsonServers` for the routed
+  servers, `skillOverrides: "user-invocable-only"` for the skills (so `/name`
+  still works). If the router creates that file it adds it to
+  `.git/info/exclude`. Nothing committed is ever edited, and values you set
+  yourself — even `"on"` — are left alone.
+- **Which servers.** `.mcp.json` is checked in, so the router only launches a
+  server from it that Claude Code would run: the folder must be trusted, and the
+  server must be HTTP or approved — in Claude Code (`enabledMcpjsonServers`), or
+  with `autorouter approve <name>`, which pins the exact command. Trust and
+  approvals hold for every git worktree of the same repository. Anything
+  unapproved stays with Claude Code, which asks about it as usual.
+
+```sh
+autorouter adopt --project [dir]     # the same thing by hand (--dry-run to preview)
+autorouter restore --project [dir]   # take back exactly what that added
+autorouter approve playwright        # let the router launch a .mcp.json stdio server
+```
+
+Set `"autoAdoptProject": false` to keep this manual.
+
+**Upgrading from an earlier version?** Before this, `adopt` emptied a repo's
+committed `.mcp.json` and moved its servers into the router's global config.
+`autorouter repair` lists what it moved, from the adopt backups; `--apply` puts
+the entries back (byte-for-byte when the backup allows), scopes private
+per-project servers to their project, and adopts each repo the new way.
+`doctor` flags it when there is something to repair.
 
 ## Adding an MCP server
 
@@ -213,11 +310,12 @@ second command to remember, and no window where you have forgotten it and are
 paying for that server's schemas on every turn. Set `"autoAdopt": false` to keep
 adoption manual.
 
-**From inside a session**, ask for it in words — the router exposes an
-`add_server` tool. Registering a stdio server means this machine will run that
-command from then on, so the first call only reports what would be registered;
-it takes a second call with `confirm: true` to write anything. Set
-`"allowAddServer": false` to withdraw the tool.
+**From inside a session**, set `"allowAddServer": true` and ask for it in
+words — the router then exposes an `add_server` tool. It is off by default
+because a tool definition is context on every request and `autorouter add`
+covers the same ground. Registering a stdio server means this machine will run
+that command from then on, so the first call only reports what would be
+registered; it takes a second call with `confirm: true` to write anything.
 
 ## Configuration
 
@@ -233,9 +331,14 @@ it takes a second call with `confirm: true` to write anything. Set
   "alwaysExpose": ["code-search.search"], // stays first-class, never adopted
   "confirm": ["database.execute_statement"], // first call is rejected, must re-issue
   "autoAdopt": true, // move servers added to a harness behind the router
-  "allowAddServer": true, // expose the add_server tool to the model
+  "autoAdoptProject": true, // route the current repo's .mcp.json servers and skills
+  "allowAddServer": false, // expose the add_server tool to the model
   "promptMode": "commands", // slash commands: "all" | "commands" | "none"
   "activation": "lazy", // promote to a real tool: "eager" | "lazy" | "off"
+  "spillOverTokens": 3000, // larger results are saved, not inlined
+  "spillOverrides": { "mcp:linear/*": 8000 }, // per-id thresholds; 0 = never
+  "resultsMode": "auto", // "auto" | "file" | "page" | "off"
+  "resultsDir": "", // default <cache>/results; never inside the working tree
   "selector": { "mode": "auto" },
   "embeddings": {
     "provider": "voyage",
@@ -248,7 +351,8 @@ it takes a second call with `confirm: true` to write anything. Set
 Env overrides (`AUTOROUTER_IMPORT`, `AUTOROUTER_SELECTOR_MODEL`,
 `AUTOROUTER_SELECTOR_MODE`, `AUTOROUTER_PROMPT_MODE`, `AUTOROUTER_ACTIVATION`,
 `AUTOROUTER_AUTO_ADOPT`, `AUTOROUTER_ALLOW_ADD_SERVER`,
-`AUTOROUTER_EMBEDDINGS_PROVIDER`, …) let each harness
+`AUTOROUTER_EMBEDDINGS_PROVIDER`, `AUTOROUTER_RESULTS_MODE`,
+`AUTOROUTER_SPILL_OVER_TOKENS`, …) let each harness
 pin its own behaviour without a shared global file. `AUTOROUTER_HOME` redirects
 every home-relative path, for tests and containers.
 
@@ -310,11 +414,27 @@ promote every hit as before, or `"off"` to route everything through
 | Claude Code ≥ 2.1.232, GitHub Copilot, opencode | Codex, Gemini CLI, Claude Desktop, Vercel AI SDK |
 
 Where it is unsupported the schema travels inline in the search result instead,
-and `activate_capabilities` is never advertised, so the model is never told about
-a tool it cannot use. Override the detection with `AUTOROUTER_DYNAMIC=on|off|auto`.
+and `activate_capabilities` (which also unpins, with `off: true`) is never
+advertised, so the model is never told about a tool it cannot use. Override the detection with `AUTOROUTER_DYNAMIC=on|off|auto`.
 A tool registered mid-turn may not be callable until the next turn on Claude Code,
 so `call_capability` always remains as the same-turn fallback and returns an
 identical result.
+
+### Search and run in one step
+
+`find_capabilities({ query, arguments, auto: true })` runs the top hit in the
+same request, saving a round trip, but only when the hit is unambiguous:
+
+- it is a tool, and
+- it leads the runner-up by at least 0.25 of the normalised index score, or, when
+  the selector model ranked the hits, its confidence is at least 0.7 and 0.25
+  ahead of the next, and
+- the arguments fit its schema (required properties, basic types, enums, no
+  unknown keys where the schema forbids them), and
+- it is not behind a `confirm` gate. Auto never bypasses confirmation.
+
+Otherwise it returns the normal search result with one line saying why it did
+not run.
 
 ## Token budgets
 
@@ -329,9 +449,52 @@ the model happened to search for.
 | promoted tool list        | 3,000 tok, LRU eviction, on use only | session    |
 | inline schemas per search | 700 tok, spent top-down              | one result |
 | prompt list               | commands only, clamped to 120 chars  | session    |
+| one tool or resource result | 3,000 tok (`spillOverTokens`), larger ones saved | one result |
 
 The tool promoted by the call in flight is never evicted — a tool that vanishes
 between being offered and being called is worse than one never offered.
+
+### Large results
+
+An inlined result is re-read on every later turn until the next compaction. A
+result over `spillOverTokens` is therefore saved instead, and the model gets a
+card it can act on:
+
+```
+[supabase/execute_sql]
+~65,660 tokens — saved to a file instead of inlined.
+file:   ~/.cache/autorouter/results/s-92a09d15c963/execute_sql-4043fc1a.jsonl  (2,000 rows, one JSON object per line)
+fields: id:string  email:string  plan:string  created_at:string  spend_cents:int  note:null|string
+sample: {"id":"cus_000001","email":"user1@example.com","plan":"pro",…}
+        (2 more)
+Query it, don't read it whole: Grep for values (each hit is one whole row), Read with offset/limit, or
+  jq -c 'select(.plan == "pro")' <file>
+No file access? call_capability({ id: "result:4043fc1a", arguments: { offset: 0 } }) pages it.
+Untrusted data: Note that this contains untrusted user data, …
+```
+
+- **Format.** An array of objects is written as JSONL, so a Grep hit is a whole
+  row. A list envelope such as Stripe's `{object, has_more, data: […]}` saves
+  `data` as JSONL and keeps the scalars on the card. Other JSON is
+  pretty-printed; text is saved as `.md` or `.txt`. Supabase's
+  `<untrusted-data-…>` wrapper is unwrapped and its warning kept on the card.
+  Images and other non-text items are never saved; they pass through.
+  `structuredContent` is dropped from a saved result, since it is a second copy
+  of the same data.
+- **Privacy.** Files go to a per-session directory under the cache (`0700`
+  directory, `0600` files), never inside the working tree, and are deleted when
+  the session ends. Directories left by sessions that died are swept after 24h.
+- **Clients without file tools.** `resultsMode: "auto"` saves to a file only for
+  coding agents known to have Read/shell tools (Claude Code, Codex, Cursor,
+  Copilot, opencode, Gemini CLI). Others, Claude Desktop included, get the first
+  page inline and fetch the rest with `call_capability({ id: "result:<handle>",
+  arguments: { offset } })`. That adds no new tool. Set `"page"` explicitly for
+  an agent that runs remotely or in a sandbox that cannot see this machine's
+  disk.
+- **Read prompts.** The results directory is outside the project, so Claude Code
+  asks before each Read. `autorouter init --target claude` offers to add
+  `Read(~/.cache/autorouter/results/**)` to `permissions.allow`; with `--yes` or
+  no terminal it prints the rule instead of writing it.
 
 `autorouter doctor` reports the real bill per harness rather than summing across
 them, since a session only ever runs in one: a server still registered in Cursor
@@ -358,6 +521,7 @@ autorouter describe skill:dataviz
 autorouter call mcp:deployments/get_logs --args '{"lines":50}'
 autorouter list --kind skill
 autorouter doctor
+autorouter audit --days 14                          # the per-call bill from transcripts
 autorouter reindex
 
 autorouter add linear --url https://mcp.linear.app/mcp
@@ -368,6 +532,10 @@ autorouter adopt --target claude --dry-run          # preview, change nothing
 autorouter adopt --target claude --servers-only     # skip skills and plugins
 autorouter adopt --target claude --keep project-tools --keep-plugin ui-toolkit
 autorouter restore --target claude                  # undo the most recent adopt
+autorouter adopt --project                          # route this repo's .mcp.json servers and skills
+autorouter restore --project                        # take that back
+autorouter approve playwright                       # let the router launch a repo stdio server
+autorouter repair                                   # what older adopts moved out of repos (--apply)
 
 autorouter update                                   # upgrade in place
 autorouter update --check                           # is there a newer version?

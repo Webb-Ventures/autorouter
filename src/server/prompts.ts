@@ -81,8 +81,8 @@ export function promptList(capabilities: Capability[], mode: PromptMode = "comma
   const prompts: Prompt[] = [
     {
       name: FIND_PROMPT,
-      description: "Search every available tool, skill and command by what you want to do.",
-      arguments: [{ name: "query", description: "What you are trying to accomplish.", required: true }],
+      description: "Search all tools, skills and commands by goal.",
+      arguments: [{ name: "query", required: true }],
     },
   ];
 
@@ -95,8 +95,8 @@ export function promptList(capabilities: Capability[], mode: PromptMode = "comma
           name: "arguments",
           // Plugin commands declare `argument-hint` for exactly this; passing it
           // through is what makes the router's slash command look like the one
-          // it replaced.
-          description: cap.argumentHint ?? "Optional arguments.",
+          // it replaced. Without one the name says enough.
+          ...(cap.argumentHint ? { description: cap.argumentHint } : {}),
           required: false,
         },
       ],

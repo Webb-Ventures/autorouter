@@ -6,6 +6,15 @@ export type ClientProfile = {
   /** Whether the client refetches tools on notifications/tools/list_changed. */
   supportsListChanged: boolean;
   supportsSampling: boolean;
+  /**
+   * Whether the agent behind this client can read files on this machine.
+   *
+   * Decides how an oversized result comes back: a file the model greps, or
+   * pages it fetches through call_capability. Guessing yes for a client with no
+   * file tools strands the data behind a path nothing can open, so only coding
+   * agents known to ship Read/shell tools say yes.
+   */
+  readsFiles: boolean;
   /** Human-readable reason, surfaced by `doctor`. */
   rationale: string;
 };
@@ -58,9 +67,16 @@ export function profileClient(
     version,
     supportsListChanged,
     supportsSampling: Boolean(caps?.sampling),
+    readsFiles: FILE_READING_CLIENTS.some((c) => name.includes(c)),
     rationale,
   };
 }
+
+/**
+ * Coding agents with file tools of their own. Claude Desktop ("claude-ai") is
+ * deliberately absent: it has no Read tool, so a saved file would be a dead end.
+ */
+const FILE_READING_CLIENTS = ["claude-code", "claude code", "codex", "cursor", "copilot", "visual studio code", "opencode", "gemini"];
 
 export function compareVersions(a: string, b: string): number {
   const pa = a.split(/[.-]/).map((x) => Number.parseInt(x, 10) || 0);
