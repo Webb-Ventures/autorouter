@@ -8,6 +8,7 @@ import type { SelectorResult } from "./selector/types.ts";
 import { ConnectionPool } from "./server/dispatch.ts";
 import { Guard } from "./server/guard.ts";
 import { readText } from "./util/fs.ts";
+import { resolve as resolvePath } from "node:path";
 
 export type RouteHit = {
   capability: Capability;
@@ -141,6 +142,30 @@ export class Router {
     return this.refreshing;
   }
 
+  /**
+   * Points the router at a different workspace.
+   *
+   * The catalog is per directory — a repo's `.mcp.json` servers and project
+   * skills are part of it — so when the host reports a different root than the
+   * one the process started in (Claude Code's roots/list), everything is
+   * re-resolved for that root. A cached catalog for it is reused when fresh.
+   * Returns false when the root did not change.
+   */
+  async retarget(cwd: string): Promise<boolean> {
+    if (resolvePath(cwd) === resolvePath(this.resolved.cwd)) return false;
+    if (this.refreshing) await this.refreshing;
+    const resolved = await resolveConfig(resolvePath(cwd));
+    const catalog = await getCatalog(resolved);
+    const index = new HybridIndex(catalog.capabilities, resolved.config);
+    await index.warmEmbeddings();
+    this.resolved = resolved;
+    this.guard = new Guard(resolved.config);
+    this.catalog = catalog;
+    this.index = index;
+    this.pool.setEntries(resolved.servers);
+    return true;
+  }
+
   /** True when the on-disk catalog has moved on from the one in memory. */
   async isStale(): Promise<boolean> {
     return await isStale(this.catalog, this.resolved.config.cacheTtlSec);
@@ -159,6 +184,12 @@ export class Router {
       .map(([kind, n]) => `${n} ${kind}${n === 1 ? "" : "s"}`);
     const domains = [...servers].slice(0, 12).join(", ");
     return `${servers.size} providers · ${parts.join(" · ")}${domains ? ` · ${domains}` : ""}`;
+  }
+
+  /** The catalog's server names, for find_capabilities' description. */
+  inventory(): string {
+    const servers = [...new Set(this.catalog.capabilities.map((c) => c.server).filter(Boolean))];
+    return servers.length > 12 ? `${servers.slice(0, 12).join(", ")} +${servers.length - 12} more` : servers.join(", ");
   }
 
   /** Total tokens the catalog would cost if every capability were exposed. */

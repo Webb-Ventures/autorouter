@@ -8,6 +8,22 @@ import type { Harness } from "./init.ts";
 import { hasAuth } from "../config/oauth.ts";
 import { promptList } from "../server/prompts.ts";
 import { tokensOf } from "../util/compact.ts";
+import { recentHookRuns } from "../util/transcripts.ts";
+import { planProjectAdopt } from "../workspace/project.ts";
+import { formatRepairPlan, planRepair } from "./repair.ts";
+import {
+  ancestorCommandLines,
+  claudeDirectServers,
+  expandDirect,
+  findHooks,
+  findInjected,
+  findStaleRefs,
+  readMemoryDocs,
+  readSettingsFiles,
+  renderHooks,
+  renderInjected,
+  renderStaleRefs,
+} from "./doctorChecks.ts";
 
 /**
  * Reports what the router can actually see and what it saves. The token
@@ -128,8 +144,9 @@ export async function runDoctor(cwd: string): Promise<string> {
   // list, which the host fetches once and carries for the session. The prompt
   // list is measured rather than assumed, because it scales with what the
   // catalog holds — quoting a flat number here would understate the bill on a
-  // machine with a large skill library.
-  const routerSurface = 700 + tokensOf(promptList(catalog.capabilities, cfg.promptMode));
+  // machine with a large skill library. The ~480 is the instructions plus the
+  // four default tools, measured over a live serve.
+  const routerSurface = 480 + tokensOf(promptList(catalog.capabilities, cfg.promptMode));
   lines.push("## Context cost");
   lines.push(`  exposing everything: ~${full.toLocaleString()} tokens`);
   lines.push(`  router surface:      ~${routerSurface.toLocaleString()} tokens`);
@@ -173,6 +190,48 @@ export async function runDoctor(cwd: string): Promise<string> {
       lines.push(`    → autorouter adopt --target ${harness}`);
     }
   }
+
+  // The repo this ran in: what serve would route, and what it cannot yet.
+  const project = await planProjectAdopt(cwd).catch(() => null);
+  if (project && (project.servers.length || project.skills.length || project.unapproved.length)) {
+    lines.push("", "## This repo");
+    if (project.servers.length) lines.push(`  .mcp.json, still loaded by Claude Code: ${project.servers.join(", ")}`);
+    if (project.skills.length) lines.push(`  project skills, still loaded by Claude Code: ${project.skills.join(", ")}`);
+    if (project.servers.length || project.skills.length) {
+      lines.push("    → a running router routes these automatically, or: autorouter adopt --project");
+    }
+    if (project.unapproved.length) {
+      lines.push(`  .mcp.json stdio servers the router may not launch: ${project.unapproved.join(", ")}`);
+      lines.push("    → autorouter approve " + project.unapproved.join(" "));
+    }
+  }
+  const repair = await planRepair().catch(() => null);
+  if (repair && formatRepairPlan(repair).length) {
+    lines.push("", "## Needs repair");
+    lines.push("  Earlier versions of adopt moved these repo servers into the global config:");
+    const all = formatRepairPlan(repair);
+    lines.push(...all.slice(0, 4).map((l) => `  ${l}`));
+    if (all.length > 4) lines.push(`    … and ${all.length - 4} more (autorouter repair lists them all)`);
+    lines.push("    → autorouter repair --apply");
+  }
+
+  // What else Claude Code loads on every call that no adopt can move.
+  const routed = resolved.servers.map((s) => s.name);
+  const settings = await readSettingsFiles(cwd);
+  const injected = await findInjected(await ancestorCommandLines());
+  const direct = expandDirect(
+    await claudeDirectServers(cwd, settings, injected.flatMap((i) => i.servers)),
+    routed,
+  );
+  const extraSections = [
+    renderHooks(findHooks(settings, await recentHookRuns())),
+    renderStaleRefs(findStaleRefs(await readMemoryDocs(cwd), routed, direct)),
+    renderInjected(injected, routed),
+  ].filter((s) => s.length);
+  for (const section of extraSections) lines.push("", ...section);
+
+  lines.push("", "Schemas are only part of the bill: `autorouter audit` reads your transcripts");
+  lines.push("for what each API call actually re-reads, and which compaction window costs least.");
 
   return lines.join("\n");
 }

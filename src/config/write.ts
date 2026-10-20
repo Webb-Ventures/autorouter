@@ -61,3 +61,36 @@ export async function removeServer(
   await writeText(path, `${JSON.stringify(config, null, 2)}\n`);
   return { removed: true, path };
 }
+
+/**
+ * Registers servers that belong to one project (config.projects[root]).
+ *
+ * A server registered for a single repo must stay scoped to it. Writing it into
+ * the top-level `servers` — which is what adopt used to do — made a repo's
+ * servers reachable from every other project the router ran in.
+ */
+export async function upsertProjectServers(
+  root: string,
+  servers: Record<string, unknown>,
+  opts: { configPath: string | null },
+): Promise<string> {
+  const path = routerConfigPath(opts.configPath);
+  await ensureDir(join(path, ".."));
+  const config = await read(path);
+  config.projects = { ...config.projects };
+  const current = config.projects[root] ?? {};
+  config.projects[root] = { ...current, servers: { ...servers, ...current.servers } };
+  await writeText(path, `${JSON.stringify(config, null, 2)}\n`);
+  return path;
+}
+
+/** Removes several top-level servers at once; returns the names actually removed. */
+export async function removeServers(names: string[], configPath: string | null): Promise<string[]> {
+  const path = routerConfigPath(configPath);
+  const config = await read(path);
+  const removed = names.filter((n) => config.servers && n in config.servers);
+  if (!removed.length) return [];
+  for (const n of removed) delete config.servers[n];
+  await writeText(path, `${JSON.stringify(config, null, 2)}\n`);
+  return removed;
+}

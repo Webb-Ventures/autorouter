@@ -5,6 +5,7 @@ import {
   GetPromptRequestSchema,
   ListPromptsRequestSchema,
   ListToolsRequestSchema,
+  RootsListChangedNotificationSchema,
   type CallToolResult,
   type GetPromptResult,
   type Tool,
@@ -22,24 +23,34 @@ import {
 } from "./prompts.ts";
 import { clamp, compactSchema, tokensOf } from "../util/compact.ts";
 import { runAutoAdopt } from "../cli/adopt.ts";
+import { runProjectAdopt } from "../workspace/project.ts";
+import { workspaceRoot } from "../workspace/root.ts";
 import { describeSpec, parseAddSpec, runAdd, type AddSpec } from "../cli/add.ts";
+import { ResultStore } from "./spill.ts";
+import { autoCallVerdict, validateArgs } from "./auto.ts";
 
 const NAME = "autorouter";
 const VERSION = "0.1.0";
 
-const INSTRUCTIONS = `This server is a capability router. Instead of loading every
-available tool into your context, it exposes a search interface over all of them.
-
-1. find_capabilities({ query }) — say what you are trying to do, in plain
-   language. Top tool hits come back with their input schema attached.
-2. call_capability({ id, arguments }) — run any hit by its id. A tool you call
-   more than once is promoted into your tool list automatically.
-3. describe_capability({ id }) — the full schema for a hit whose schema was
-   abbreviated, or a skill's instruction text. Reading those instructions is how
-   a skill runs.
-
-Search before concluding something is impossible: the catalog is much larger
-than your tool list.`;
+/**
+ * Server instructions, worded for the activation mode actually in force.
+ *
+ * The promotion sentence used to say "a tool you call more than once is
+ * promoted", which was never what lazy mode did — it promotes after the first
+ * successful call — and is simply false under "eager" or "off". The model plans
+ * around this text, so it has to describe the real behaviour.
+ */
+export function instructionsFor(activation: RouterConfig["activation"]): string {
+  const promotion =
+    activation === "lazy"
+      ? " After its first successful call a tool joins your tool list (where supported)."
+      : activation === "eager"
+        ? " Tool hits join your tool list (where supported)."
+        : "";
+  // Claude Code defers tool schemas but injects this text into every request,
+  // so it carries only what the model needs before it has loaded any tool.
+  return `Most tools, skills and MCP servers are behind find_capabilities: search it by goal before deciding something can't be done. Run a hit with call_capability.${promotion} describe_capability returns a full schema, or a skill's instructions; reading them is how a skill runs.`;
+}
 
 export async function serve(opts: { cwd?: string } = {}): Promise<void> {
   const router = await Router.create({ cwd: opts.cwd });
@@ -53,11 +64,14 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
         // surface every MCP prompt as /mcp__<server>__<name>.
         prompts: { listChanged: true },
       },
-      instructions: INSTRUCTIONS,
+      instructions: instructionsFor(router.resolved.config.activation),
     },
   );
 
   let profile: ClientProfile | null = null;
+  /** Oversized results, saved to disk or held for paging. */
+  const results = new ResultStore(router.resolved.config, router.resolved.cwd);
+  void results.sweep();
   /** Capabilities promoted to real tools, keyed by their exposed tool name. */
   const activated = new Map<string, Capability>();
   const { promptMode, activation, allowAddServer } = router.resolved.config;
@@ -90,10 +104,58 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
     return name ?? null;
   };
 
+  /**
+   * Routes the current repo's `.mcp.json` servers and project skills, and hides
+   * them from the harness through that repo's settings.local.json. Safe to call
+   * repeatedly: a second pass finds nothing new and writes nothing.
+   */
+  async function adoptProject(): Promise<void> {
+    try {
+      const { notes, plan } = await runProjectAdopt(router.resolved.cwd, { auto: true });
+      for (const note of notes) {
+        log(note);
+        pendingNotes.push(`${note} — restart the harness to reclaim its context.`);
+      }
+      if (plan?.unapproved.length) {
+        log(`not routing unapproved .mcp.json server(s): ${plan.unapproved.join(", ")}`);
+      }
+    } catch {
+      // Never fail a session over a settings file we could not update.
+    }
+  }
+
+  /**
+   * Follows the host's workspace. Claude Code answers roots/list with its launch
+   * directory (plus --add-dir ones) and announces changes; the first root is the
+   * project whose servers and skills belong in the catalog.
+   */
+  async function syncRoots(): Promise<void> {
+    if (!server.getClientCapabilities()?.roots) return;
+    try {
+      const { roots } = await server.listRoots();
+      const before = router.summary();
+      const moved = await router.retarget(workspaceRoot(roots.map((r) => r.uri)));
+      if (!moved) return;
+      log(`workspace: ${router.resolved.cwd}`);
+      await adoptProject();
+      if (router.summary() !== before) {
+        server.sendToolListChanged?.();
+        server.sendPromptListChanged?.();
+      }
+    } catch {
+      // A host that advertises roots but fails to list them keeps the startup root.
+    }
+  }
+
   server.oninitialized = () => {
     profile = profileClient(server.getClientVersion(), server.getClientCapabilities());
+    results.setReadsFiles(profile.readsFiles);
     log(`client: ${profile.name} ${profile.version} — ${profile.rationale}`);
+    void syncRoots();
   };
+  server.setNotificationHandler(RootsListChangedNotificationSchema, async () => {
+    await syncRoots();
+  });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     // Cheap staleness check on a request the host makes anyway. A long-lived
@@ -129,13 +191,18 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
           // and found in the same request — a host that never re-lists its tools
           // would otherwise never trigger the check at all.
           if (await router.isStale()) await refreshAndAnnounce();
-          return await handleFind(router, server, profile, activated, activation, args as any, drainNotes());
+          return await handleFind(router, server, profile, activated, activation, args as any, drainNotes(), {
+            results,
+            promoteOnUse,
+          });
         case "describe_capability":
           return await handleDescribe(router, args as any);
         case "call_capability":
-          return await handleCall(router, promoteOnUse, args as any);
+          return await handleCall(router, promoteOnUse, args as any, results);
         case "activate_capabilities":
+          if ((args as { off?: boolean }).off) return await handleDeactivate(server, activated, args as any);
           return await handleActivate(router, server, activated, args as any);
+        // No longer advertised; still answered for hosts holding an old tool list.
         case "deactivate_capabilities":
           return await handleDeactivate(server, activated, args as any);
         case "add_server":
@@ -145,7 +212,7 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
           // Already a first-class tool: the host validated the arguments and
           // named it in its own permission prompt, so there is nothing to
           // promote and no proxy disclaimer to add.
-          if (cap) return await invoke(router, cap, args, true);
+          if (cap) return await invoke(router, cap, args, true, results);
           return errorResult(`Unknown tool: ${name}. Use find_capabilities to search.`);
         }
       }
@@ -184,6 +251,7 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
         log(note);
         pendingNotes.push(`${note} — restart the harness to reclaim its context.`);
       }
+      await adoptProject();
       if (adopted.length) await router.refresh({ force: true });
     } catch {
       // Never fail the request that happened to trigger the check.
@@ -215,6 +283,8 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   log(`ready — ${router.summary()}`);
+  // Hosts without roots never call syncRoots, so the startup root is adopted here.
+  void adoptProject();
 
   // connect() resolves as soon as the transport is wired up, but the server has
   // to outlive that — the caller exits the process on the returned promise, so
@@ -226,7 +296,8 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
       if (done) return;
       done = true;
       router.close().catch(() => {});
-      resolve();
+      // Saved results can hold production data; they go with the session.
+      results.cleanup().finally(resolve);
     };
     server.onclose = finish;
     transport.onclose = finish;
@@ -246,49 +317,46 @@ function routerTools(
   const tools: Tool[] = [
     {
       name: "find_capabilities",
-      description: `Search every available tool, skill, prompt and command by what you are trying to do, and get back only the ones that fit. Catalog: ${router.summary()}. Use this whenever a task might need a capability you cannot already see — searching is cheap and the catalog is much larger than your tool list.`,
+      // The server names stay: they are what lets a host's own tool search
+      // match "supabase" to this tool.
+      description: `Search all tools, skills and commands by goal; returns only what fits. Servers: ${router.inventory()}.`,
       inputSchema: {
         type: "object",
         properties: {
           query: {
             type: "string",
-            description:
-              "What you are trying to accomplish, in plain language. Describe the goal, not a guessed tool name.",
+            description: "The goal in plain words, not a tool name.",
           },
           kind: {
             type: "string",
             enum: ["tool", "skill", "prompt", "resource", "command", "agent"],
-            description: "Optional: restrict results to one kind of capability.",
           },
-          server: { type: "string", description: "Optional: restrict to one provider." },
-          limit: { type: "number", description: "Max results (default 8)." },
+          server: { type: "string" },
+          limit: { type: "number", description: "Default 8." },
+          arguments: { type: "object" },
+          auto: { type: "boolean", description: "Run the top hit with arguments if it clearly wins." },
         },
         required: ["query"],
       },
     },
     {
       name: "describe_capability",
-      description:
-        "Get full detail for one capability id from find_capabilities: the complete input schema for a tool, or the full instruction text for a skill or command.",
+      description: "Full input schema of a tool, or full instructions of a skill or command.",
       inputSchema: {
         type: "object",
-        properties: { id: { type: "string", description: "Capability id, e.g. mcp:supabase/execute_sql" } },
+        properties: { id: { type: "string", description: "e.g. mcp:supabase/execute_sql" } },
         required: ["id"],
       },
     },
     {
       name: "call_capability",
-      description:
-        "Run a capability by id and return its result. Works for tools, prompts and resources; skills and commands are executed by following the text from describe_capability instead.",
+      description: "Run a tool, prompt or resource by id. Skills and commands run by following describe_capability's text.",
       inputSchema: {
         type: "object",
         properties: {
-          id: { type: "string", description: "Capability id to invoke." },
-          arguments: { type: "object", description: "Arguments matching the capability's input schema." },
-          confirm: {
-            type: "boolean",
-            description: "Set true to proceed with a capability that requires explicit confirmation.",
-          },
+          id: { type: "string" },
+          arguments: { type: "object" },
+          confirm: { type: "boolean", description: "Required by some capabilities." },
         },
         required: ["id"],
       },
@@ -297,40 +365,29 @@ function routerTools(
 
   // Only advertise dynamic exposure where the client will actually honour the
   // list_changed notification — otherwise the model activates tools that never
-  // materialize and has no way to recover. Under "off" the pair is dead weight
+  // materialize and has no way to recover. Under "off" the tool is dead weight
   // in every request, so it does not ship at all.
   if (profile?.supportsListChanged && activation !== "off") {
-    tools.push(
-      {
-        name: "activate_capabilities",
-        description:
-          "Promote capabilities to real, first-class tools in your tool list so you can call them directly with full schema validation. Use after find_capabilities when you expect to call something several times.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            ids: { type: "array", items: { type: "string" }, description: "Capability ids to promote." },
-          },
-          required: ["ids"],
+    // One tool for both directions: a separate deactivate tool cost a whole
+    // definition for something used about once a session.
+    tools.push({
+      name: "activate_capabilities",
+      description: "Pin tools into your tool list to call directly. off: true unpins them (all, if ids is omitted).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ids: { type: "array", items: { type: "string" } },
+          off: { type: "boolean" },
         },
       },
-      {
-        name: "deactivate_capabilities",
-        description: "Remove previously activated capabilities from your tool list to reclaim context.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            ids: { type: "array", items: { type: "string" }, description: "Ids to remove; omit to remove all." },
-          },
-        },
-      },
-    );
+    });
   }
 
   if (allowAddServer) {
     tools.push({
       name: "add_server",
       description:
-        "Register a new MCP server behind the router, instead of running `claude mcp add`. Pass url or command+args, or json for a pasted {\"mcpServers\":{…}} snippet. Rejected without confirm: true.",
+        "Register an MCP server behind the router (not `claude mcp add`): url, command+args, or json for an {\"mcpServers\":…} snippet. Needs confirm: true.",
       inputSchema: {
         type: "object",
         properties: {
@@ -488,8 +545,16 @@ async function handleFind(
   profile: ClientProfile | null,
   activated: Map<string, Capability>,
   activation: RouterConfig["activation"],
-  args: { query?: string; kind?: CapabilityKind; server?: string; limit?: number },
+  args: {
+    query?: string;
+    kind?: CapabilityKind;
+    server?: string;
+    limit?: number;
+    arguments?: unknown;
+    auto?: boolean;
+  },
   notes: string[] = [],
+  ctx: { results?: ResultStore; promoteOnUse?: (cap: Capability) => Promise<string | null> } = {},
 ): Promise<CallToolResult> {
   const query = (args.query ?? "").trim();
   if (!query) return errorResult("query is required");
@@ -515,10 +580,51 @@ async function handleFind(
     ? await promote(server, activated, result.hits.map((h) => h.capability))
     : [];
 
+  // find + call in one request. It saves the model a round trip when the task
+  // is unambiguous; anything short of a clear winner with arguments that fit
+  // falls back to the normal result, with the reason stated so the model knows
+  // what to do instead.
+  let autoNote: string | null = null;
+  if (args.auto === true) {
+    const verdict = autoCallVerdict(result.hits);
+    const top = result.hits[0]?.capability;
+    let reason = verdict.ok ? null : verdict.reason;
+    if (!reason && top) {
+      const problems = validateArgs(top.inputSchema, args.arguments ?? {});
+      if (problems.length) reason = `arguments do not fit ${top.id}: ${problems.join("; ")}`;
+      // Auto must never be a way round a confirm gate: the gate exists so a
+      // human sees the resolved target before anything runs.
+      else if (router.guard.requiresConfirmation(top)) {
+        reason = `${top.id} requires confirmation; check with the user, then call_capability with confirm: true`;
+      }
+    }
+    if (!reason && top && verdict.ok) {
+      const out = await invoke(router, top, args.arguments ?? {}, false, ctx.results);
+      const promotedName = out.isError ? null : await ctx.promoteOnUse?.(top);
+      const others = result.hits.slice(1, 4).map((h) => h.capability.id);
+      const lead = [
+        ...notes.map((n) => `[autorouter] ${n}`),
+        `[autorouter] auto-ran ${top.id} (${verdict.why}).${others.length ? ` Other matches: ${others.join(", ")}.` : ""}`,
+      ].join("\n");
+      return {
+        ...out,
+        content: [
+          { type: "text" as const, text: lead },
+          ...out.content,
+          ...(promotedName
+            ? [{ type: "text" as const, text: `(now in your tool list as ${promotedName} — call it directly next time)` }]
+            : []),
+        ],
+      };
+    }
+    autoNote = `[autorouter] auto: not run — ${reason}.`;
+  }
+
   // Inlining schemas here as well would pay for them twice — the host is about
   // to list these tools with their schemas already attached.
   const body = renderRouteResult(query, result, { inlineSchemas: promoted.length === 0 });
-  const text = notes.length ? `${notes.map((n) => `[autorouter] ${n}`).join("\n")}\n\n${body}` : body;
+  const lead = [...notes.map((n) => `[autorouter] ${n}`), ...(autoNote ? [autoNote] : [])];
+  const text = lead.length ? `${lead.join("\n")}\n\n${body}` : body;
   if (!promoted.length) return textResult(text);
 
   return textResult(
@@ -595,11 +701,17 @@ async function handleCall(
   router: Router,
   promoteOnUse: (cap: Capability) => Promise<string | null>,
   args: { id?: string; arguments?: unknown; confirm?: boolean },
+  results?: ResultStore,
 ): Promise<CallToolResult> {
   if (!args.id) return errorResult("id is required");
+  // A page of a result too large to inline. Reusing call_capability keeps the
+  // surface at the same tools rather than adding a reader of its own.
+  if (args.id.startsWith("result:") && results) {
+    return await results.page(args.id.slice("result:".length), (args.arguments ?? {}) as Record<string, unknown>);
+  }
   const cap = router.get(args.id);
   if (!cap) return errorResult(`No capability with id "${args.id}".`);
-  const out = await invoke(router, cap, args.arguments ?? {}, args.confirm === true);
+  const out = await invoke(router, cap, args.arguments ?? {}, args.confirm === true, results);
 
   // Only a call that worked earns a place in the tool list. A failed one is as
   // likely to mean the model picked the wrong capability as that it needs this
@@ -624,20 +736,30 @@ async function invoke(
   cap: Capability,
   args: unknown,
   confirmed: boolean,
+  results?: ResultStore,
 ): Promise<CallToolResult> {
   try {
     const out = await router.call(cap.id, args, { confirmed });
     if (out.capability.kind === "skill" || out.capability.kind === "command" || out.capability.kind === "agent") {
       return { content: out.content, isError: false };
     }
+    let content = out.content as CallToolResult["content"];
+    let structured = out.structuredContent;
+    // Data results only: a prompt's messages are instructions, and an error is
+    // short and has to be read whole to be acted on.
+    if (results && !out.isError && (cap.kind === "tool" || cap.kind === "resource")) {
+      const processed = await results.process(cap.id, out.source, content, structured);
+      content = processed.content;
+      // structuredContent is a second copy of the same data; keeping it would
+      // put back exactly what the card took out.
+      if (processed.spilled) structured = undefined;
+    }
     // The host's permission prompt only ever saw "call_capability", so the
     // resolved target has to be visible in the result itself.
     return {
-      content: [{ type: "text" as const, text: `[${out.source}]` }, ...out.content],
+      content: [{ type: "text" as const, text: `[${out.source}]` }, ...content],
       isError: out.isError,
-      ...(out.structuredContent
-        ? { structuredContent: out.structuredContent as Record<string, unknown> }
-        : {}),
+      ...(structured ? { structuredContent: structured as Record<string, unknown> } : {}),
     };
   } catch (err) {
     return errorResult(err instanceof Error ? err.message : String(err));
