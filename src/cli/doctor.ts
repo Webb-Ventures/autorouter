@@ -193,11 +193,17 @@ export async function runDoctor(cwd: string): Promise<string> {
 
   // The repo this ran in: what serve would route, and what it cannot yet.
   const project = await planProjectAdopt(cwd).catch(() => null);
-  if (project && (project.servers.length || project.skills.length || project.unapproved.length)) {
+  if (
+    project &&
+    (project.servers.length || project.skills.length || project.migrated.length || project.unapproved.length)
+  ) {
     lines.push("", "## This repo");
     if (project.servers.length) lines.push(`  .mcp.json, still loaded by Claude Code: ${project.servers.join(", ")}`);
     if (project.skills.length) lines.push(`  project skills, still loaded by Claude Code: ${project.skills.join(", ")}`);
-    if (project.servers.length || project.skills.length) {
+    if (project.migrated.length) {
+      lines.push(`  project skills Claude cannot invoke (user-invocable-only): ${project.migrated.join(", ")}`);
+    }
+    if (project.servers.length || project.skills.length || project.migrated.length) {
       lines.push("    → a running router routes these automatically, or: autorouter adopt --project");
     }
     if (project.unapproved.length) {

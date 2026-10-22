@@ -27,8 +27,8 @@ export const INSTRUCTION_KINDS = new Set(["skill", "command", "agent"]);
  * Which kinds each mode publishes.
  *
  * Skills are excluded by default because publishing them is close to pure
- * duplication: `adopt --skill-mode user-invocable-only` leaves a local skill's
- * native `/name` working, and a plugin's skills are surfaced by the harness on
+ * duplication: `adopt` hides a local skill as "name-only", which leaves its
+ * native `/name` and Skill-tool invocation working, and a plugin's skills are surfaced by the harness on
  * demand rather than injected. What is left is the set the harness genuinely
  * cannot offer once adopted — plugin commands and subagents — which is a
  * handful of prompts instead of a hundred and fifty.

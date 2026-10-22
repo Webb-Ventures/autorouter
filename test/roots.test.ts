@@ -66,7 +66,7 @@ test("serve follows roots/list and adopts that repo's skills", async () => {
     expect(
       await eventually(async () => {
         const text = await readFile(join(repoA, ".claude", "settings.local.json"), "utf8").catch(() => "");
-        return text.includes('"alpha-deployer": "user-invocable-only"');
+        return text.includes('"alpha-deployer": "name-only"');
       }),
     ).toBe(true);
 
