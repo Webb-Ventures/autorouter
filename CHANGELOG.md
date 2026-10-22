@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Hidden skills are invocable by Claude again. Adopt hid them as
+  `skillOverrides: "user-invocable-only"`, which Claude Code enforces by
+  rejecting every Skill-tool call ("Skill … is disabled for model invocation")
+  — so a skill named in CLAUDE.md, another skill, or a request failed instead
+  of loading. Both project and user adoption now use `"name-only"`: the
+  description leaves context, the name stays, and the Skill tool works.
+  Project entries autorouter wrote the old way are migrated on the next
+  pick-up (or `adopt --project`); `doctor` lists any still pending.
+  `--skill-mode` accepts `name-only` (default), `user-invocable-only`, `off`.
+
 ### Added
 
 - `autorouter audit`: the real context bill, read from Claude Code's

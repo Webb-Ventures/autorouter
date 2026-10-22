@@ -211,7 +211,7 @@ describe("adopt: skills and plugins", () => {
     expect(res.extras?.skills.map((s) => s.name)).toEqual(["demo"]);
 
     const settings = JSON.parse(await readFile(join(home, ".claude/settings.json"), "utf8"));
-    expect(settings.skillOverrides.demo).toBe("user-invocable-only");
+    expect(settings.skillOverrides.demo).toBe("name-only");
     expect(settings.enabledPlugins["demoplug@mkt"]).toBe(false);
     // Unrelated settings must survive the rewrite.
     expect(settings.model).toBe("opus");

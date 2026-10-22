@@ -52,10 +52,10 @@ the system prompt, and an enabled plugin contributes its own skills, commands
 _and_ servers just by being installed. On Claude Code, `adopt` handles those too,
 using the only two levers the harness exposes:
 
-| what    | how                                            | effect                                                  |
-| ------- | ---------------------------------------------- | ------------------------------------------------------- |
-| skills  | `skillOverrides[name] = "user-invocable-only"` | out of the model's context; `/name` still works for you |
-| plugins | `enabledPlugins[id] = false`                   | plugin's skills, commands and servers all stop loading  |
+| what    | how                                  | effect                                                                    |
+| ------- | ------------------------------------ | ------------------------------------------------------------------------- |
+| skills  | `skillOverrides[name] = "name-only"` | description out of context; Claude can still invoke it, `/name` still works |
+| plugins | `enabledPlugins[id] = false`         | plugin's skills, commands and servers all stop loading                    |
 
 The router still finds all of them — it reads `~/.claude/skills` and
 `installed_plugins.json` directly, which record _installation_, not what the
@@ -262,8 +262,10 @@ show up in another project — and Claude Code stops pre-loading them.
   per-app skills from the top.
 - **How they leave context.** Only through the repo's own, private
   `.claude/settings.local.json`: `disabledMcpjsonServers` for the routed
-  servers, `skillOverrides: "user-invocable-only"` for the skills (so `/name`
-  still works). If the router creates that file it adds it to
+  servers, `skillOverrides: "name-only"` for the skills (so Claude can still
+  invoke them by name, and `/name` still works). Entries earlier versions wrote
+  as `"user-invocable-only"` — which blocks the Skill tool — are moved to
+  `"name-only"` on the next pick-up. If the router creates that file it adds it to
   `.git/info/exclude`. Nothing committed is ever edited, and values you set
   yourself — even `"on"` — are left alone.
 - **Which servers.** `.mcp.json` is checked in, so the router only launches a
@@ -372,8 +374,8 @@ plugin commands and subagents are republished as ones:
 list is permanent context — the host fetches it once and carries it for the whole
 session — and skills are the bulk of it: one plugin shipping 141 of them costs
 ~11.5k tokens on every turn, which is more than adopting that plugin saves. The
-alias is also mostly redundant, since `adopt --skill-mode user-invocable-only`
-leaves a local skill's native `/name` working and a plugin's skills are surfaced
+alias is also mostly redundant, since `adopt` hides a local skill as
+`name-only`, which leaves its native `/name` and Skill-tool invocation working and a plugin's skills are surfaced
 by the harness on demand rather than injected. Skills stay fully searchable
 either way; set `"promptMode": "all"` to get `/mcp__autorouter__skill_name` back,
 or `"none"` to publish only `find`.
@@ -673,8 +675,11 @@ auditable.
 Adopting skills and plugins edits `~/.claude/settings.json`, a file you also edit
 by hand. The whole file is backed up verbatim alongside the server moves and
 `restore` rewrites it byte for byte, but it is a shared file and worth knowing
-about. Hidden skills default to `user-invocable-only` rather than `off` for the
-same reason: `/name` keeps working, so the capability is relocated, not removed.
+about. Hidden skills default to `name-only` for the same reason: Claude can
+still invoke them and `/name` keeps working, so the capability is relocated,
+not removed. `--skill-mode user-invocable-only` drops the name too, but Claude
+Code then refuses any Skill-tool call for it ("disabled for model invocation");
+`off` removes `/name` as well.
 
 ## Development
 

@@ -5,6 +5,7 @@ import { runInit, type Harness } from "./cli/init.ts";
 import { runDoctor } from "./cli/doctor.ts";
 import { runAudit } from "./cli/audit.ts";
 import { runAdopt, runRestore } from "./cli/adopt.ts";
+import type { SkillMode } from "./cli/adoptExtras.ts";
 import { runAdd, runRemove } from "./cli/add.ts";
 import { runLogin, summarizeScopes } from "./cli/login.ts";
 import { runUpdate } from "./cli/update.ts";
@@ -83,7 +84,8 @@ Options
   --keep-skill S adopt: leave skill S loaded (comma-separated)
   --keep-plugin P adopt: leave plugin P enabled (comma-separated)
   --servers-only adopt: move MCP servers only; leave skills and plugins loaded
-  --skill-mode M adopt: user-invocable-only (default, /name still works) | off
+  --skill-mode M adopt: name-only (default; Claude and /name can still invoke it)
+                 | user-invocable-only (Claude cannot invoke it) | off
   --port N       login: loopback callback port (default 33418; keep it stable)
   --client-id ID login: use a pre-registered OAuth client (servers without RFC 7591)
   --client-secret S  login: its secret, if it is a confidential client
@@ -531,14 +533,15 @@ async function cmdAdopt(flags: Flags): Promise<number> {
   const list = (v: unknown) => String(v ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   const keep = list(flags.keep);
   const dryRun = Boolean(flags["dry-run"]);
-  const skillMode = flags["skill-mode"] === "off" ? "off" : "user-invocable-only";
-  if (flags["skill-mode"] && !["off", "user-invocable-only"].includes(String(flags["skill-mode"]))) {
-    console.error("--skill-mode must be user-invocable-only or off");
+  const skillModes: SkillMode[] = ["name-only", "user-invocable-only", "off"];
+  const skillMode = (flags["skill-mode"] ?? "name-only") as SkillMode;
+  if (!skillModes.includes(skillMode)) {
+    console.error(`--skill-mode must be ${skillModes.join(", ")}`);
     return 1;
   }
   const extrasOpts = {
     extras: !flags["servers-only"],
-    skillMode: skillMode as "off" | "user-invocable-only",
+    skillMode,
     keepSkills: list(flags["keep-skill"]),
     keepPlugins: list(flags["keep-plugin"]),
   };

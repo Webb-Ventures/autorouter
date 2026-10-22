@@ -136,7 +136,7 @@ describe("project skills", () => {
       skillPaths: ["~/.claude/skills", ".claude/skills"],
       keepSkills: [],
       keepPlugins: [],
-      mode: "user-invocable-only",
+      mode: "name-only",
       routedServers: new Set(),
     });
     expect(plan.skills.map((s) => s.name)).toEqual(["mine"]);
@@ -158,7 +158,7 @@ describe("project adoption", () => {
     await applyProjectAdopt(plan);
     const local = await readJson(join(repo, ".claude", "settings.local.json"));
     expect(local.disabledMcpjsonServers).toEqual(["remote"]);
-    expect(local.skillOverrides).toEqual({ deploy: "user-invocable-only" });
+    expect(local.skillOverrides).toEqual({ deploy: "name-only" });
     expect(await readFile(join(repo, ".mcp.json"), "utf8")).toBe(mcpBefore);
 
     // Idempotent: a second pass finds nothing to do.
@@ -176,7 +176,31 @@ describe("project adoption", () => {
     await runProjectAdopt(repo);
     const local = await readJson(join(repo, ".claude", "settings.local.json"));
     expect(local.permissions).toEqual({ allow: ["Bash(ls)"] });
-    expect(local.skillOverrides).toEqual({ pinned: "on", deploy: "user-invocable-only" });
+    expect(local.skillOverrides).toEqual({ pinned: "on", deploy: "name-only" });
+  });
+
+  test("moves skills it hid as user-invocable-only to name-only, leaving the user's own alone", async () => {
+    await skill(repo, "deploy");
+    await skill(repo, "mine");
+    await runProjectAdopt(repo);
+    // What an earlier version wrote: Claude cannot invoke either skill.
+    await write(join(repo, ".claude", "settings.local.json"), {
+      skillOverrides: { deploy: "user-invocable-only", mine: "user-invocable-only" },
+    });
+    // Only "deploy" was autorouter's; "mine" the user set by hand.
+    await write(join(home, ".autorouter", "projects.json"), { [repo]: { servers: [], skills: ["deploy"] } });
+
+    const plan = (await planProjectAdopt(repo))!;
+    expect(plan.migrated).toEqual(["deploy"]);
+    expect(plan.skills).toEqual([]);
+    await applyProjectAdopt(plan);
+    const local = await readJson(join(repo, ".claude", "settings.local.json"));
+    expect(local.skillOverrides).toEqual({ deploy: "name-only", mine: "user-invocable-only" });
+    expect((await runProjectAdopt(repo)).notes).toEqual([]);
+
+    await restoreProject(repo);
+    const back = await readJson(join(repo, ".claude", "settings.local.json"));
+    expect(back.skillOverrides).toEqual({ mine: "user-invocable-only" });
   });
 
   test("restore removes exactly what was added", async () => {

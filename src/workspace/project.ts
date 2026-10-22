@@ -17,7 +17,12 @@ import { isHome } from "./root.ts";
  * — through two documented settings:
  *
  *   disabledMcpjsonServers: [name]               the server is not started
- *   skillOverrides: { name: "user-invocable-only" }  out of context, /name works
+ *   skillOverrides: { name: "name-only" }    description out of context; Claude
+ *                                            can still invoke it, /name works
+ *
+ * Not "user-invocable-only": that blocks the Skill tool outright, so any time
+ * Claude knows a skill's name — from CLAUDE.md, another skill, or the user
+ * asking for it — the call fails instead of loading it.
  *
  * Nothing committed is edited, nothing leaks into other projects, and every key
  * written is recorded so `restore --project` removes exactly those and leaves
@@ -30,6 +35,8 @@ export type ProjectPlan = {
   file: string;
   servers: string[];
   skills: string[];
+  /** Skills an earlier version set to LEGACY_SKILL_MODE, moved to SKILL_MODE. */
+  migrated: string[];
   /** Servers left alone because the router may not launch them. */
   unapproved: string[];
 };
@@ -43,7 +50,9 @@ type LocalSettings = {
 /** What autorouter added to each repo's settings.local.json, so it can be taken back out. */
 type ProjectState = Record<string, { servers: string[]; skills: string[] }>;
 
-const SKILL_MODE = "user-invocable-only";
+const SKILL_MODE = "name-only";
+/** What earlier versions wrote; it stops Claude invoking the skill at all. */
+const LEGACY_SKILL_MODE = "user-invocable-only";
 
 export function projectStatePath(): string {
   return join(homeDir(), ".autorouter", "projects.json");
@@ -62,7 +71,7 @@ export async function planProjectAdopt(rootIn: string): Promise<ProjectPlan | nu
   const settings = await readLocalSettings(file);
   if (settings === "invalid") return null;
 
-  const plan: ProjectPlan = { root, file, servers: [], skills: [], unapproved: [] };
+  const plan: ProjectPlan = { root, file, servers: [], skills: [], migrated: [], unapproved: [] };
   const disabled = new Set(settings.disabledMcpjsonServers ?? []);
 
   if (resolved.config.import.includes("claude")) {
@@ -76,6 +85,12 @@ export async function planProjectAdopt(rootIn: string): Promise<ProjectPlan | nu
     includePlugins: false,
   });
   const overrides = settings.skillOverrides ?? {};
+  // Only values autorouter itself wrote are migrated; a user's own
+  // "user-invocable-only" is a deliberate choice.
+  const ours = new Set((await readState())[root]?.skills ?? []);
+  for (const [name, value] of Object.entries(overrides)) {
+    if (value === LEGACY_SKILL_MODE && ours.has(name)) plan.migrated.push(name);
+  }
   for (const cap of capabilities) {
     // An explicit value — even "on" — is the user's decision, not ours to change.
     if (cap.origin !== "project" || cap.name in overrides) continue;
@@ -83,13 +98,14 @@ export async function planProjectAdopt(rootIn: string): Promise<ProjectPlan | nu
   }
   plan.servers.sort();
   plan.skills.sort();
+  plan.migrated.sort();
   plan.unapproved.sort();
   return plan;
 }
 
 /** Applies a plan; returns human-readable notes (empty when there was nothing to do). */
 export async function applyProjectAdopt(plan: ProjectPlan): Promise<string[]> {
-  if (!plan.servers.length && !plan.skills.length) return [];
+  if (!plan.servers.length && !plan.skills.length && !plan.migrated.length) return [];
   const settings = await readLocalSettings(plan.file);
   if (settings === "invalid") return [];
   const created = !(await exists(plan.file));
@@ -98,9 +114,9 @@ export async function applyProjectAdopt(plan: ProjectPlan): Promise<string[]> {
   if (plan.servers.length) {
     next.disabledMcpjsonServers = [...new Set([...(settings.disabledMcpjsonServers ?? []), ...plan.servers])];
   }
-  if (plan.skills.length) {
+  if (plan.skills.length || plan.migrated.length) {
     next.skillOverrides = { ...settings.skillOverrides };
-    for (const name of plan.skills) next.skillOverrides[name] = SKILL_MODE;
+    for (const name of [...plan.skills, ...plan.migrated]) next.skillOverrides[name] = SKILL_MODE;
   }
 
   await ensureDir(join(plan.file, ".."));
@@ -111,6 +127,9 @@ export async function applyProjectAdopt(plan: ProjectPlan): Promise<string[]> {
   const notes: string[] = [];
   if (plan.servers.length) notes.push(`routing ${plan.servers.join(", ")} from ${plan.root}/.mcp.json`);
   if (plan.skills.length) notes.push(`routing ${plan.skills.length} project skill(s) in ${plan.root}`);
+  if (plan.migrated.length) {
+    notes.push(`made ${plan.migrated.length} project skill(s) invocable by Claude again in ${plan.root}`);
+  }
   return notes;
 }
 
@@ -147,7 +166,8 @@ export async function restoreProject(rootIn: string): Promise<string[]> {
     next.skillOverrides = { ...next.skillOverrides };
     for (const name of added.skills) {
       // Only take back a value we set; one the user has since changed is theirs.
-      if (next.skillOverrides[name] === SKILL_MODE) delete next.skillOverrides[name];
+      const value = next.skillOverrides[name];
+      if (value === SKILL_MODE || value === LEGACY_SKILL_MODE) delete next.skillOverrides[name];
     }
   }
   await writeText(file, `${JSON.stringify(next, null, 2)}\n`);

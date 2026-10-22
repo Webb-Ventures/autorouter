@@ -153,7 +153,7 @@ export async function runAdopt(opts: {
           skillPaths: resolved.config.skillPaths,
           keepSkills: opts.keepSkills ?? [],
           keepPlugins: opts.keepPlugins ?? [],
-          mode: opts.skillMode ?? "user-invocable-only",
+          mode: opts.skillMode ?? "name-only",
           routedServers,
           unreachable: opts.unreachable,
         })
@@ -204,7 +204,11 @@ export async function runAdopt(opts: {
   if (extras?.skills.length) {
     notes.push(
       `Hid ${extras.skills.length} skill(s) from the model` +
-        (extras.skills[0]?.mode === "user-invocable-only" ? " — /name still works for you." : "."),
+        (extras.skills[0]?.mode === "name-only"
+          ? " — Claude can still invoke them by name, and /name still works for you."
+          : extras.skills[0]?.mode === "user-invocable-only"
+            ? " — /name still works for you."
+            : "."),
     );
   }
   if (extras?.plugins.length) notes.push(`Disabled ${extras.plugins.length} plugin(s).`);

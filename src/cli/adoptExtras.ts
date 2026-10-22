@@ -17,17 +17,19 @@ import { collectSkills } from "../catalog/providers/skills.ts";
  *   skillOverrides[name] = "off" | "user-invocable-only" | "name-only" | "on"
  *   enabledPlugins["plugin@marketplace"] = false
  *
- * "user-invocable-only" is the one that matters: the skill disappears from the
- * model's context but `/name` still works for the user. That is precisely the
+ * "name-only" is the default: the description — the bulk of a skill's listing
+ * cost — leaves the model's context, but the name stays listed, so Claude can
+ * still invoke the skill and `/name` still works. That is precisely the
  * router's bargain — the capability stays available, it just stops being
- * pre-loaded — so it is the default. "off" would take the slash command away
- * too, which is a loss the user did not ask for.
+ * pre-loaded. "user-invocable-only" also drops the name, and blocks the Skill
+ * tool with it: Claude can then never load the skill, even when CLAUDE.md or
+ * the user names it. "off" takes the slash command away too.
  *
  * No other harness has an equivalent. Codex, Cursor and VS Code have no skill
  * or plugin concept to disable, so this is deliberately Claude-Code-only rather
  * than a lowest-common-denominator abstraction.
  */
-export type SkillMode = "user-invocable-only" | "off";
+export type SkillMode = "name-only" | "user-invocable-only" | "off";
 
 export type ExtrasPlan = {
   file: string;
@@ -142,7 +144,7 @@ export async function planExtras(opts: {
     if (cap.server && (disabledPluginNames.has(cap.server) || untouched.has(cap.server))) continue;
     if (keepSkills.has(cap.name)) continue;
     const current = settings.skillOverrides?.[cap.name];
-    if (current === "off" || current === "user-invocable-only") {
+    if (current === "off" || current === "user-invocable-only" || current === "name-only") {
       plan.skipped.push(`skill ${cap.name} (already ${current})`);
       continue;
     }

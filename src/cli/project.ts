@@ -20,17 +20,19 @@ export async function cmdAdoptProject(root: string, dryRun: boolean): Promise<nu
     console.log(`Nothing to adopt in ${root} (home directory, or settings.local.json is not valid JSON).`);
     return 0;
   }
-  if (!plan.servers.length && !plan.skills.length) {
+  const changes = plan.servers.length + plan.skills.length + plan.migrated.length;
+  if (!changes) {
     console.log(`Nothing to adopt in ${root}.`);
   } else {
     console.log(plan.file);
     for (const s of plan.servers) console.log(`  disable .mcp.json server  ${s}   → routed`);
-    for (const s of plan.skills) console.log(`  hide project skill        ${s}   → user-invocable-only`);
+    for (const s of plan.skills) console.log(`  hide project skill        ${s}   → name-only`);
+    for (const s of plan.migrated) console.log(`  unblock project skill     ${s}   user-invocable-only → name-only`);
   }
   for (const s of plan.unapproved) {
     console.log(`  leave     ${s}   (not approved for the router: autorouter approve ${s})`);
   }
-  if (dryRun || (!plan.servers.length && !plan.skills.length)) return 0;
+  if (dryRun || !changes) return 0;
   for (const note of await applyProjectAdopt(plan)) console.log(`✓ ${note}`);
   console.log("Restart Claude Code in this repo to reclaim the context.");
   return 0;
