@@ -26,6 +26,16 @@ export type AddResult = {
   message: string;
 };
 
+export type AddOptions = {
+  /**
+   * Told about each step that can take long enough to look like a hang.
+   *
+   * A callback rather than a print, because `runAdd` also backs the
+   * `add_server` tool, where stdout is the MCP channel and must stay clean.
+   */
+  onProgress?: (line: string) => void;
+};
+
 /**
  * Parses whatever the user had to hand into one named server entry.
  *
@@ -88,7 +98,11 @@ export function describeSpec(raw: RawServer): string {
  * — refusing to save an unreachable server would make the recovery step
  * impossible to reach.
  */
-export async function runAdd(spec: AddSpec, cwd = process.cwd()): Promise<AddResult> {
+export async function runAdd(
+  spec: AddSpec,
+  cwd = process.cwd(),
+  opts: AddOptions = {},
+): Promise<AddResult> {
   const { name, raw } = parseAddSpec(spec);
   const target = describeSpec(raw);
 
@@ -110,6 +124,16 @@ export async function runAdd(spec: AddSpec, cwd = process.cwd()): Promise<AddRes
     configPath: resolved.configPath,
     overwrite: true,
   });
+
+  // Everything from here on waits on the server. `npx -y some-big-package` can
+  // spend minutes downloading on its first run, and saying nothing meanwhile
+  // reads as a hang right after the config file visibly changed.
+  opts.onProgress?.(`Saved ${name} to ${path}.`);
+  opts.onProgress?.(
+    entry.transport === "stdio"
+      ? `Starting ${name} to list what it offers. A first run can be slow while the command downloads…`
+      : `Connecting to ${name} to list what it offers…`,
+  );
 
   let client;
   let capabilities: number | undefined;
@@ -138,6 +162,7 @@ export async function runAdd(spec: AddSpec, cwd = process.cwd()): Promise<AddRes
   // Rebuild now rather than waiting out the TTL, so the very next search sees
   // it. A running serve process picks the same change up from the config file's
   // fingerprint.
+  opts.onProgress?.("Rebuilding the catalog…");
   const router = await Router.create({ cwd, force: true });
   await router.close();
 

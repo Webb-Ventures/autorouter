@@ -285,6 +285,28 @@ describe("add", () => {
     expect(written.servers.linear).toEqual({ url: "https://mcp.linear.app/mcp" });
   }, 30_000);
 
+  test("reports each slow step, in order, once the entry is saved", async () => {
+    const fixture = join(import.meta.dir, "fixtures", "fake-mcp-server.ts");
+    const lines: string[] = [];
+    const res = await runAdd({ name: "fake", command: "bun", args: [fixture] }, dir, {
+      onProgress: (line) => lines.push(line),
+    });
+    expect(res.ok).toBe(true);
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toContain(`Saved fake to ${process.env.AUTOROUTER_CONFIG}`);
+    // The stdio wording is the one that explains a long first run.
+    expect(lines[1]).toMatch(/Starting fake .*first run/);
+    expect(lines[2]).toContain("Rebuilding the catalog");
+  }, 30_000);
+
+  test("says nothing when it refuses before saving", async () => {
+    const lines: string[] = [];
+    await runAdd({ name: "loop", command: "npx", args: ["autorouter", "serve"] }, dir, {
+      onProgress: (line) => lines.push(line),
+    });
+    expect(lines).toEqual([]);
+  });
+
   test("accepts a pasted mcpServers snippet, and a bare entry with a name", async () => {
     expect(parseAddSpec({ json: '{"mcpServers":{"linear":{"url":"https://x/mcp"}}}' })).toEqual({
       name: "linear",

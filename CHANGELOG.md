@@ -17,6 +17,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Project entries autorouter wrote the old way are migrated on the next
   pick-up (or `adopt --project`); `doctor` lists any still pending.
   `--skill-mode` accepts `name-only` (default), `user-invocable-only`, `off`.
+- `autorouter add` says what it is waiting on. It saved the entry, then started
+  the server and rebuilt the catalog without printing anything, so a first run
+  of `npx -y <large package>` looked like a hang right after the config file
+  changed. Each step now prints a line to stderr; stdout still carries only the
+  result.
 
 ### Added
 
