@@ -234,6 +234,9 @@ async function cmdAdd(name: string | undefined, flags: Flags, rest: string[]): P
       command: (flags.command as string | undefined) ?? rest[0],
       args: flags.command ? undefined : rest.slice(1),
       json: flags.json as string | undefined,
+    }, process.cwd(), {
+      // stderr, so stdout carries only the result line.
+      onProgress: (line) => console.error(line),
     });
     console.log(result.message);
     if (!result.ok && result.path) {
