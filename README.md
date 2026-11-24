@@ -599,9 +599,10 @@ server that already had a grant both change nothing, so neither pays for an
 index rebuild.
 
 Registration is RFC 7591 dynamic client registration, so there is no app to
-create first. Tokens live in `~/.autorouter/oauth/<server>.json` at `0600` and
+create first (for a server that has none, name your own app in the entry's
+[`oauth` block](#oauth-settings-in-the-server-entry)). Tokens live in `~/.autorouter/oauth/<server>.json` at `0600` and
 are refreshed automatically; `logout` deletes them. The loopback redirect uses a
-fixed port (33418, `--port` or `$AUTOROUTER_OAUTH_PORT` to change it) because the
+fixed port (33418; `--port`, `oauth.callbackPort` or `$AUTOROUTER_OAUTH_PORT` to change it) because the
 redirect URI is baked into the registration a provider stores — a grant obtained
 on one port cannot be refreshed from another.
 
@@ -662,6 +663,55 @@ each stored grant actually covers.
 Until a server has a grant, `adopt` refuses to move it or to disable the plugin
 that supplies it. Moving a server the router cannot reach would delete a working
 capability, so `doctor` and `adopt` both print the exact `login` command instead.
+
+### OAuth settings in the server entry
+
+An http server's entry can carry the same `oauth` block Claude Code reads from
+`.mcp.json` and `~/.claude.json`, and the router honours it wherever the entry
+came from — its own config, a harness config, a plugin, or a repo's `.mcp.json`:
+
+```json
+{
+  "servers": {
+    "gmail": {
+      "url": "https://gmailmcp.googleapis.com/mcp/v1",
+      "oauth": {
+        "clientId": "1234-abc.apps.googleusercontent.com",
+        "clientSecret": "${GMAIL_CLIENT_SECRET}",
+        "callbackPort": 8080,
+        "scopes": "https://www.googleapis.com/auth/gmail.readonly"
+      }
+    }
+  }
+}
+```
+
+| field | what it does |
+|---|---|
+| `clientId` | The OAuth app to use, for servers without dynamic client registration. Same as `login --client-id`, without retyping it. |
+| `clientSecret` | That app's secret, if it has one. `${VAR}` is expanded, and `login` stops with the variable's name if it is not set. |
+| `callbackPort` | The loopback port for the redirect, to match a redirect URI you registered. `--port` overrides it for one run. |
+| `authServerMetadataUrl` | Authorization server metadata to use instead of the discovery chain. Must be `https://`. Its `scopes_supported` replaces what the server advertises. |
+| `scopes` | Pins what a login requests, as one space-separated string. |
+
+With a `clientId` in the entry, `autorouter login gmail` needs no flags, and
+background connections refresh with the same client. The configured client
+outranks one stored by an earlier registration, so after adding or changing it,
+run `login --force`. A `--client-id` that contradicts the entry is refused
+rather than quietly used for one run.
+
+`clientSecret` is the one difference from Claude Code, which keeps the secret
+in the system keychain. The router does not read another program's keychain, so
+it takes the secret from the entry, or from `login --client-secret` when you
+would rather it were not in the file — that copy is stored with the tokens at
+`0600` and used only for the configured `clientId`.
+
+`scopes` is a pin, not a default. A login requests exactly that set whatever
+the server advertises, plus `offline_access` when the server offers it, so the
+grant can be refreshed. `--read-only` narrows inside the pin, `--all-scopes`
+cannot widen past it, and `--scopes` still overrides it for one run. Editing
+the pin takes effect on the next `login --force`; when a call then fails for
+want of a scope, the error names the pin as the thing to change.
 
 ### Local (stdio) servers
 

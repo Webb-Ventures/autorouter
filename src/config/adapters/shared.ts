@@ -1,4 +1,4 @@
-import type { ServerEntry, ServerSpec } from "../types.ts";
+import type { OAuthSettings, ServerEntry, ServerSpec } from "../types.ts";
 import { absPath } from "../../util/paths.ts";
 
 /** The shape every harness uses for a stdio/http MCP server entry. */
@@ -18,6 +18,14 @@ export type RawServer = {
   startupTimeoutSec?: number;
   /** Sign-in command for a stdio server: an argv, or one whitespace-split string. */
   login?: string | string[];
+  /** Claude Code's OAuth block for an http server. See OAuthSettings. */
+  oauth?: {
+    clientId?: unknown;
+    clientSecret?: unknown;
+    callbackPort?: unknown;
+    authServerMetadataUrl?: unknown;
+    scopes?: unknown;
+  };
 };
 
 /**
@@ -81,6 +89,7 @@ export function normalizeServer(
       transport: "http",
       url: expandEnv(raw.url),
       headers: expandHeaders(raw.headers),
+      oauth: oauthSettings(raw.oauth),
     };
   }
 
@@ -97,6 +106,42 @@ export function normalizeServer(
     startupTimeoutSec: raw.startup_timeout_sec ?? raw.startupTimeoutSec,
     login: loginCommand(raw.login, origin),
   };
+}
+
+/**
+ * Reads an entry's `oauth` block, keeping only the fields that hold something.
+ *
+ * Lenient about the value types because these blocks are hand-written: a port
+ * quoted as a string and scopes given as an array both mean what they obviously
+ * mean. Anything unusable is dropped rather than passed on, so the rest of the
+ * router can treat a present field as a valid one. The metadata URL is the
+ * exception — it is kept as written and checked where it is used, because a
+ * rejected URL deserves an error naming it, not a silent fall back to discovery.
+ */
+export function oauthSettings(raw: RawServer["oauth"]): OAuthSettings | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const text = (v: unknown) => (typeof v === "string" && v.trim() ? expandEnv(v.trim()) : undefined);
+  const out: OAuthSettings = {};
+
+  const clientId = text(raw.clientId);
+  if (clientId) out.clientId = clientId;
+  const clientSecret = text(raw.clientSecret);
+  if (clientSecret) out.clientSecret = clientSecret;
+
+  const port = typeof raw.callbackPort === "string" ? Number(raw.callbackPort.trim() || NaN) : raw.callbackPort;
+  if (typeof port === "number" && Number.isInteger(port) && port > 0 && port < 65536) out.callbackPort = port;
+
+  const metadataUrl = text(raw.authServerMetadataUrl);
+  if (metadataUrl) out.authServerMetadataUrl = metadataUrl;
+
+  // RFC 6749 §3.3 is space-separated, which is what Claude Code documents. An
+  // array or commas are the same list written by someone thinking in JSON.
+  const scopes = (Array.isArray(raw.scopes) ? raw.scopes.map(String).join(" ") : (text(raw.scopes) ?? ""))
+    .split(/[\s,]+/)
+    .filter(Boolean);
+  if (scopes.length) out.scopes = [...new Set(scopes)].join(" ");
+
+  return Object.keys(out).length ? out : undefined;
 }
 
 /**

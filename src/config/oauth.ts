@@ -1,15 +1,25 @@
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import type { OAuthClientProvider, OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
-import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
+import type {
+  OAuthClientProvider,
+  OAuthDiscoveryState,
+  OAuthServerInfo,
+} from "@modelcontextprotocol/sdk/client/auth.js";
+import { UnauthorizedError, discoverOAuthServerInfo } from "@modelcontextprotocol/sdk/client/auth.js";
+import {
+  OAuthMetadataSchema,
+  OpenIdProviderDiscoveryMetadataSchema,
+} from "@modelcontextprotocol/sdk/shared/auth.js";
 import type {
   OAuthClientInformationMixed,
   OAuthClientMetadata,
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
+import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { homeDir } from "../util/paths.ts";
 import { describeNetworkError } from "../util/net.ts";
+import type { OAuthSettings } from "./types.ts";
 
 /**
  * Many of the most expensive MCP servers — Datadog, Supabase, Linear — carry no
@@ -36,11 +46,24 @@ export type StoredAuth = {
   /** Cached RFC 9728/8414 discovery, so a reconnect is one request not four. */
   discovery?: OAuthDiscoveryState;
   /**
+   * The configured `oauth.authServerMetadataUrl` the cached discovery came
+   * from; absent when it came from the ordinary discovery chain. A cache built
+   * one way is not an answer for the other, so a changed setting discards it.
+   */
+  discoverySource?: string;
+  /**
    * The scopes this grant was deliberately narrowed to, kept so `login --force`
    * and any re-authorization repeat the choice instead of silently widening
    * back to everything the provider advertises.
    */
   requestedScope?: string;
+  /**
+   * The configured `oauth.scopes` in force when `requestedScope` was chosen. A
+   * re-login only inherits the old narrowing while this still matches: an
+   * edited pin is an instruction, and repeating the previous request would
+   * ignore it.
+   */
+  pinnedScope?: string;
   /**
    * Whether `clientInformation` was registered with the device grant in its
    * grant_types. A client registered for the browser flow alone is refused at
@@ -121,6 +144,88 @@ export async function setClientInformation(
 }
 
 /**
+ * Names the `${VAR}` references still unexpanded in a server's OAuth client.
+ *
+ * Config expansion leaves an unset variable intact so the failure is legible,
+ * but for a client id or secret that means sending the literal text
+ * `${GMAIL_CLIENT_SECRET}` to the provider and getting back `invalid_client`,
+ * which points at the provider rather than at the shell that never exported it.
+ */
+export function unsetOAuthVars(settings: OAuthSettings | undefined): string[] {
+  const names = new Set<string>();
+  for (const value of [settings?.clientId, settings?.clientSecret]) {
+    for (const m of value?.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)/g) ?? []) names.add(m[1]!);
+  }
+  return [...names];
+}
+
+/**
+ * Fetches the authorization server metadata named by `oauth.authServerMetadataUrl`.
+ *
+ * This replaces the discovery chain rather than seeding it: the setting exists
+ * for servers whose standard endpoints error, so falling back to them on a
+ * failure here would hide the misconfiguration behind a second, unrelated
+ * error. Returns undefined when nothing is configured.
+ */
+export async function configuredServerInfo(
+  settings: OAuthSettings | undefined,
+  fetchFn: FetchLike = fetch,
+): Promise<OAuthServerInfo | undefined> {
+  const configured = settings?.authServerMetadataUrl;
+  if (!configured) return undefined;
+  let url: URL;
+  try {
+    url = new URL(configured);
+  } catch {
+    throw new Error(`oauth.authServerMetadataUrl is not a URL: ${configured}`);
+  }
+  // Same rule as Claude Code. The document names the endpoints the client
+  // secret and the authorization code are sent to, so it must not be something
+  // a network attacker can rewrite.
+  if (url.protocol !== "https:") {
+    throw new Error(`oauth.authServerMetadataUrl must use https://, got ${configured}`);
+  }
+
+  let res: Response;
+  try {
+    res = await fetchFn(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
+  } catch (err) {
+    throw new Error(
+      `could not fetch oauth.authServerMetadataUrl (${configured}): ${describeNetworkError(err) ?? (err instanceof Error ? err.message : String(err))}`,
+    );
+  }
+  if (!res.ok) throw new Error(`oauth.authServerMetadataUrl (${configured}) returned HTTP ${res.status}`);
+  const body: unknown = await res.json().catch(() => undefined);
+  // RFC 8414 first: its schema keeps unknown keys, and the device endpoint is
+  // one of them. The OIDC schema is the fallback for a provider whose document
+  // only validates as OpenID discovery.
+  const parsed = OAuthMetadataSchema.safeParse(body);
+  const metadata = parsed.success ? parsed.data : OpenIdProviderDiscoveryMetadataSchema.safeParse(body).data;
+  if (!metadata) {
+    throw new Error(
+      `oauth.authServerMetadataUrl (${configured}) is not authorization server metadata — ` +
+        `it needs at least issuer, authorization_endpoint and token_endpoint`,
+    );
+  }
+  return { authorizationServerUrl: metadata.issuer, authorizationServerMetadata: metadata };
+}
+
+/**
+ * Discovery for a server, honouring a configured metadata URL.
+ *
+ * Every place that asks "what does this server's authorization server offer"
+ * goes through here, so a server with `authServerMetadataUrl` is never probed
+ * at the standard endpoints it was configured to avoid.
+ */
+export async function discoverServerInfo(
+  url: string,
+  settings: OAuthSettings | undefined,
+  fetchFn: FetchLike = fetch,
+): Promise<OAuthServerInfo> {
+  return (await configuredServerInfo(settings, fetchFn)) ?? (await discoverOAuthServerInfo(url, { fetchFn }));
+}
+
+/**
  * The SDK-facing provider. `onRedirect` is what distinguishes the two modes:
  * during `autorouter login` it opens a browser, and during a normal connection
  * it throws, because a background reindex must never silently hang waiting for
@@ -131,6 +236,9 @@ export class FileTokenStore implements OAuthClientProvider {
     private readonly server: string,
     private readonly redirectPort: number,
     private readonly onRedirect: (url: URL) => void | Promise<void>,
+    /** The server entry's `oauth` block, when it has one. */
+    private readonly settings?: OAuthSettings,
+    private readonly fetchFn: FetchLike = fetch,
   ) {}
 
   get redirectUrl(): string {
@@ -178,15 +286,43 @@ export class FileTokenStore implements OAuthClientProvider {
    * repeat them; the SDK invalidates this itself on an auth failure.
    */
   async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
-    return (await readAuth(this.server)).discovery;
+    const stored = await readAuth(this.server);
+    const source = this.settings?.authServerMetadataUrl;
+    if (stored.discovery && stored.discoverySource === source) return stored.discovery;
+    // Nothing cached for this setting. With a configured metadata URL the
+    // answer comes from there, and returning it is what stops the SDK running
+    // the discovery chain — including after it drops the cache on an auth
+    // failure, when a background reconnect would otherwise probe the very
+    // endpoints this server was configured to bypass.
+    const configured = await configuredServerInfo(this.settings, this.fetchFn);
+    // Saved here because the SDK only re-saves a state it added something to,
+    // and one fetched from a metadata URL may come back from it unchanged.
+    if (configured) await this.saveDiscoveryState(configured);
+    return configured;
   }
 
   async saveDiscoveryState(state: OAuthDiscoveryState): Promise<void> {
-    await writeAuth(this.server, { discovery: state });
+    await writeAuth(this.server, {
+      discovery: state,
+      discoverySource: this.settings?.authServerMetadataUrl,
+    });
   }
 
+  /**
+   * A client named in the server's config outranks a stored one: the config is
+   * where the user says which app this server uses, and a registration left
+   * over from before they said so belongs to a different client. The stored
+   * secret is still used when it was saved for the same id, which is how
+   * `login --client-secret` supplies one that is deliberately not in the file.
+   */
   async clientInformation(): Promise<OAuthClientInformationMixed | undefined> {
-    return (await readAuth(this.server)).clientInformation;
+    const stored = (await readAuth(this.server)).clientInformation;
+    const id = this.settings?.clientId;
+    if (!id) return stored;
+    const secret =
+      this.settings?.clientSecret ??
+      (stored?.client_id === id && "client_secret" in stored ? stored.client_secret : undefined);
+    return { client_id: id, ...(secret ? { client_secret: secret } : {}) };
   }
 
   async saveClientInformation(info: OAuthClientInformationMixed): Promise<void> {
@@ -312,13 +448,24 @@ export function scopeChallenge(server: string): ScopeChallenge | undefined {
  * A 403 is the same idea one step along: the grant exists but was narrowed
  * past what the capability needs, and the fix is a different command.
  */
-export function authHint(server: string, err: unknown): string {
+export function authHint(server: string, err: unknown, settings?: OAuthSettings): string {
   const message = err instanceof Error ? err.message : String(err);
   const challenge = scopeChallenges.get(server);
   if (challenge && /\b403\b|insufficient_scope|upscoping/i.test(message)) {
     const missing = challenge.required.length
       ? `the ${challenge.required.join(", ")} scope${challenge.required.length > 1 ? "s" : ""}`
       : "a scope";
+    // A pinned server asks for its pin and nothing else, so --all-scopes would
+    // re-issue the same grant. The pin is the thing to change.
+    if (settings?.scopes) {
+      return (
+        `grant is too narrow — this needs ${missing}, which the stored grant does not have.\n` +
+        `  This server's scopes are pinned by oauth.scopes in its config (${settings.scopes.split(" ").join(", ")}).\n` +
+        `  Add the missing scope there, then replace the grant:\n` +
+        `    autorouter login ${server} --force` +
+        (challenge.description ? `\n  Server said: ${challenge.description}` : "")
+      );
+    }
     return (
       `grant is too narrow — this needs ${missing}, which the stored grant does not have.\n` +
       `  Scopes are fixed when a grant is issued and refreshing cannot widen one, so this\n` +
@@ -342,8 +489,17 @@ export function authHint(server: string, err: unknown): string {
  * and refresh a stored token, but refuses to start a browser flow — the router
  * is usually running as a background stdio server with nobody watching.
  */
-export function backgroundAuth(server: string, port: number = CALLBACK_PORT): FileTokenStore {
-  return new FileTokenStore(server, port, () => {
-    throw new NeedsLoginError(server);
-  });
+export function backgroundAuth(
+  server: string,
+  port: number = CALLBACK_PORT,
+  settings?: OAuthSettings,
+): FileTokenStore {
+  return new FileTokenStore(
+    server,
+    settings?.callbackPort ?? port,
+    () => {
+      throw new NeedsLoginError(server);
+    },
+    settings,
+  );
 }

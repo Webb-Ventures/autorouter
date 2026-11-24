@@ -142,7 +142,7 @@ export async function runAdd(
     client = await connect(entry);
     capabilities = (await enumerateServer(entry, client)).length;
   } catch (err) {
-    failure = authHint(name, err);
+    failure = authHint(name, err, entry.transport === "http" ? entry.oauth : undefined);
   } finally {
     try {
       await client?.close();

@@ -76,7 +76,7 @@ function httpTransport(entry: Extract<ServerEntry, { transport: "http" }>) {
   // Cursor, where there is no harness token to fall back on.
   const init = {
     ...(entry.headers ? { requestInit: { headers: entry.headers } } : {}),
-    authProvider: backgroundAuth(entry.name),
+    authProvider: backgroundAuth(entry.name, undefined, entry.oauth),
     fetch: serializeRefresh(entry.name, scopeAwareFetch(entry.name)),
   };
   return /\/sse\/?$/.test(url.pathname)

@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { auth, discoverOAuthServerInfo } from "@modelcontextprotocol/sdk/client/auth.js";
+import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { OAuthServerInfo } from "@modelcontextprotocol/sdk/client/auth.js";
 import { resolveConfig } from "../config/resolve.ts";
 import { serializeRefresh } from "../config/refresh.ts";
@@ -9,9 +9,11 @@ import {
   CALLBACK_PORT,
   FileTokenStore,
   clearAuth,
+  discoverServerInfo,
   hasAuth,
   readAuth,
   setClientInformation,
+  unsetOAuthVars,
   writeAuth,
 } from "../config/oauth.ts";
 import {
@@ -21,7 +23,7 @@ import {
   requestableScopes,
   unknownScopes,
 } from "../config/scopes.ts";
-import type { ServerEntry } from "../config/types.ts";
+import type { OAuthSettings, ServerEntry } from "../config/types.ts";
 import { runLocalLogin } from "./loginLocal.ts";
 
 /**
@@ -32,6 +34,10 @@ import { runLocalLogin } from "./loginLocal.ts";
  * flow. A fixed port is used rather than an ephemeral one because the port is
  * baked into the redirect_uri that gets registered with the provider, and a
  * registration made on one port is useless on the next run.
+ *
+ * A server entry's `oauth` block (the one Claude Code reads) supplies the
+ * client, the callback port, the scopes to pin and a metadata URL to use
+ * instead of discovery. Flags given for one run outrank it.
  */
 
 export type LoginResult = {
@@ -115,9 +121,33 @@ export async function runLogin(opts: {
     };
   }
   if (opts.listScopes) return await describeScopes(entry);
+
+  const configured = entry.oauth;
+  const unset = unsetOAuthVars(configured);
+  if (unset.length) {
+    return {
+      ok: false,
+      message:
+        `${entry.name}: its oauth config refers to ${unset.map((n) => `\${${n}}`).join(", ")}, which ` +
+        `${unset.length > 1 ? "are" : "is"} not set in this shell.\n` +
+        `  Export ${unset.length > 1 ? "them" : "it"} and run the command again.`,
+    };
+  }
+  // The config says which app this server uses. A different id on the command
+  // line would authorize with one client and leave every later connection
+  // refreshing with the other, which fails in a way that names neither.
+  if (opts.clientId && configured?.clientId && opts.clientId !== configured.clientId) {
+    return {
+      ok: false,
+      message:
+        `${entry.name}: --client-id differs from the oauth.clientId in this server's config.\n` +
+        `  The configured client is the one every connection uses, so change it there, or drop the flag.`,
+    };
+  }
+
   // Read before --force wipes the file, so the replacement grant can inherit
   // the narrowing the old one was given.
-  const previousScope = (await readAuth(entry.name)).requestedScope;
+  const { requestedScope: previousScope, pinnedScope: previousPin } = await readAuth(entry.name);
   if (opts.force) await clearAuth(entry.name);
   else if (await hasAuth(entry.name)) {
     // A scope request against an existing grant is a no-op without --force, and
@@ -144,12 +174,20 @@ export async function runLogin(opts: {
     return { ok: false, message: "--device and --manual are different flows; pick one." };
   }
 
-  const port = opts.port ?? CALLBACK_PORT;
-  if (opts.clientId) {
+  const port = opts.port ?? configured?.callbackPort ?? CALLBACK_PORT;
+  // --client-secret on its own completes a client whose id is in the config:
+  // that is the arrangement for a secret kept out of the file.
+  const clientId = opts.clientId ?? (opts.clientSecret ? configured?.clientId : undefined);
+  if (clientId) {
     await setClientInformation(entry.name, {
-      client_id: opts.clientId,
+      client_id: clientId,
       ...(opts.clientSecret ? { client_secret: opts.clientSecret } : {}),
     });
+  } else if (opts.clientSecret) {
+    return {
+      ok: false,
+      message: `${entry.name}: --client-secret needs a client to belong to; pass --client-id, or set oauth.clientId in the server's config.`,
+    };
   }
   const want = {
     scopes: opts.scopes,
@@ -159,12 +197,15 @@ export async function runLogin(opts: {
     // this, `login --force` after a `--read-only` login quietly hands back a
     // full-access token.
     previous: previousScope,
+    previousPin,
+    pinned: configured?.scopes,
   };
 
   const mode = await resolveMode(entry, opts);
   if (mode.kind === "device") {
     const chosen = chooseScopes(mode.advertised, want);
     if ("error" in chosen) return { ok: false, message: `${entry.name}: ${chosen.error}` };
+    if (chosen.note) console.log(`Note: ${chosen.note}`);
     if (mode.announce) console.log(mode.announce);
     const result = await runDeviceFlow({
       server: entry.name,
@@ -172,6 +213,7 @@ export async function runLogin(opts: {
       scope: chosen.scope,
       info: mode.info,
       port,
+      settings: configured,
     });
     if (!result.ok) return result;
     return {
@@ -209,17 +251,17 @@ async function resolveMode(
   // or --read-only would fail claiming the server advertises none. Failures are
   // not fatal — the flow that runs next repeats discovery and reports properly.
   if (opts.device) {
-    const info = await discoverOAuthServerInfo(entry.url).catch(() => undefined);
-    return { kind: "device", info, advertised: advertisedFrom(info) };
+    const info = await discoverServerInfo(entry.url, entry.oauth).catch(() => undefined);
+    return { kind: "device", info, advertised: advertisedFrom(info, entry.oauth) };
   }
   if (!looksHeadless()) return { kind: "browser" };
 
-  const info = await discoverOAuthServerInfo(entry.url).catch(() => undefined);
+  const info = await discoverServerInfo(entry.url, entry.oauth).catch(() => undefined);
   if (info && deviceEndpoint(info.authorizationServerMetadata)) {
     return {
       kind: "device",
       info,
-      advertised: advertisedFrom(info),
+      advertised: advertisedFrom(info, entry.oauth),
       announce:
         `No display detected, so this is using the device flow instead of opening a browser.\n` +
         `  Pass --manual to paste a redirect URL instead, or --port with X11/SSH forwarding to\n` +
@@ -242,7 +284,25 @@ async function resolveMode(
 async function describeScopes(
   entry: Extract<ServerEntry, { transport: "http" }>,
 ): Promise<LoginResult> {
-  const advertised = await advertisedScopes(entry.url);
+  const advertised = advertisedFrom(
+    await discoverServerInfo(entry.url, entry.oauth).catch(() => undefined),
+    entry.oauth,
+  );
+  const pinned = entry.oauth?.scopes ? parseScopeList(entry.oauth.scopes) : [];
+  if (pinned.length) {
+    // The pin is what a login will ask for, so it is the list worth showing;
+    // what the server advertises is only context for editing it.
+    const ro = readOnlyScopes(pinned);
+    const others = advertised.filter((s) => !pinned.includes(s));
+    return {
+      ok: true,
+      message:
+        `${entry.name} scopes, pinned by oauth.scopes in its config:\n` +
+        pinned.map((s) => `  ${ro.includes(s) ? "read " : "write"}  ${s}`).join("\n") +
+        (others.length ? `\n\n  Also advertised, not requested: ${others.join(", ")}` : "") +
+        `\n\n  A login requests exactly the pinned set; edit oauth.scopes to change it.`,
+    };
+  }
   if (!advertised.length) {
     return {
       ok: true,
@@ -264,31 +324,26 @@ async function describeScopes(
   };
 }
 
-/** The same precedence as advertisedScopes(), over discovery already in hand. */
-function advertisedFrom(info: OAuthServerInfo | undefined): string[] {
-  return requestableScopes(
-    info?.resourceMetadata?.scopes_supported,
-    info?.authorizationServerMetadata?.scopes_supported,
-  );
-}
-
-/** What this resource accepts, per the precedence in requestableScopes(). */
-async function advertisedScopes(url: string): Promise<string[]> {
-  try {
-    const info = await discoverOAuthServerInfo(url);
-    return requestableScopes(
-      info.resourceMetadata?.scopes_supported,
-      info.authorizationServerMetadata?.scopes_supported,
-    );
-  } catch {
-    return [];
-  }
+/**
+ * What this resource accepts, per the precedence in requestableScopes().
+ *
+ * The resource document wins over the authorization server's when it says
+ * anything at all — the server's list spans every API it fronts, and Supabase
+ * rejects the authorize request outright when scopes outside the MCP
+ * resource's own 13 are included. A configured metadata URL reverses that: it
+ * was put there to say what this server's authorization looks like, so its
+ * list is the one to use (and Claude Code does the same).
+ */
+function advertisedFrom(info: OAuthServerInfo | undefined, settings?: OAuthSettings): string[] {
+  const fromServer = info?.authorizationServerMetadata?.scopes_supported;
+  if (settings?.authServerMetadataUrl && fromServer?.length) return [...new Set(fromServer)];
+  return requestableScopes(info?.resourceMetadata?.scopes_supported, fromServer);
 }
 
 async function authorize(
   entry: Extract<ServerEntry, { transport: "http" }>,
   port: number,
-  want: { scopes?: string; readOnly?: boolean; allScopes?: boolean; previous?: string },
+  want: ScopeRequest,
   mode: "browser" | "manual" = "browser",
 ): Promise<LoginResult> {
   // Captured after auth() generates it, and compared against what the browser
@@ -346,24 +401,28 @@ async function authorize(
   let advertised: string[] = [];
   let canRegister = true;
   try {
-    const info = await discoverOAuthServerInfo(entry.url);
-    // The resource document wins over the authorization server's when it says
-    // anything at all — the server's list spans every API it fronts, and
-    // Supabase rejects the authorize request outright when scopes outside the
-    // MCP resource's own 13 are included. See requestableScopes().
-    advertised = requestableScopes(
-      info.resourceMetadata?.scopes_supported,
-      info.authorizationServerMetadata?.scopes_supported,
-    );
+    const info = await discoverServerInfo(entry.url, entry.oauth);
+    advertised = advertisedFrom(info, entry.oauth);
     canRegister = Boolean(info.authorizationServerMetadata?.registration_endpoint);
-  } catch {
-    // Discovery failures are not fatal here — auth() repeats the discovery and
-    // will report the real problem with better context.
+  } catch (err) {
+    // A metadata URL the user configured is the only source of discovery this
+    // server has, so its failure is the answer rather than something auth()
+    // could report better.
+    if (entry.oauth?.authServerMetadataUrl) {
+      server.close();
+      return { ok: false, message: `${entry.name}: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    // Otherwise discovery failures are not fatal here — auth() repeats the
+    // discovery and will report the real problem with better context.
   }
 
   const chosen = chooseScopes(advertised, want);
-  if ("error" in chosen) return { ok: false, message: `${entry.name}: ${chosen.error}` };
+  if ("error" in chosen) {
+    server.close();
+    return { ok: false, message: `${entry.name}: ${chosen.error}` };
+  }
   const scope = chosen.scope;
+  if (chosen.note) console.log(`Note: ${chosen.note}`);
   if (chosen.warn?.length) {
     console.log(
       `Note: ${chosen.warn.join(", ")} ${chosen.warn.length > 1 ? "are" : "is"} not in ` +
@@ -375,18 +434,20 @@ async function authorize(
   // Not every provider implements RFC 7591 — GitHub's MCP, for one, expects an
   // OAuth app you created yourself. Say so before opening a browser onto a
   // request that cannot succeed.
-  if (!canRegister && !(await readAuth(entry.name)).clientInformation) {
+  if (!canRegister && !entry.oauth?.clientId && !(await readAuth(entry.name)).clientInformation) {
+    server.close();
     return {
       ok: false,
       message:
         `${entry.name} does not support dynamic client registration, so it needs an OAuth ` +
         `app you register yourself.\n` +
         `  Redirect URI to enter: ${`http://localhost:${port}/callback`}\n` +
-        `  Then: autorouter login ${entry.name} --client-id <id> [--client-secret <secret>]`,
+        `  Then: autorouter login ${entry.name} --client-id <id> [--client-secret <secret>]\n` +
+        `  or set "oauth": { "clientId": "<id>" } on the server in its config.`,
     };
   }
 
-  const provider = new FileTokenStore(entry.name, port, (url) => {
+  const onRedirect = (url: URL) => {
     if (mode === "manual") {
       console.log(
         `\nOpen this on any machine with a browser and authorize ${entry.name}:\n\n  ${url}\n\n` +
@@ -398,7 +459,8 @@ async function authorize(
     }
     console.log(`\nOpening your browser to authorize ${entry.name}:\n  ${url}\n`);
     openBrowser(url.toString());
-  });
+  };
+  const provider = new FileTokenStore(entry.name, port, onRedirect, entry.oauth);
 
   try {
     const first = await auth(provider, { serverUrl: entry.url, scope, fetchFn: serializeRefresh(entry.name, fetch) });
@@ -423,7 +485,7 @@ async function authorize(
     if (result !== "AUTHORIZED") {
       return { ok: false, message: `${entry.name}: token exchange did not complete (${result}).` };
     }
-    if (scope) await writeAuth(entry.name, { requestedScope: scope });
+    if (scope) await writeAuth(entry.name, { requestedScope: scope, pinnedScope: want.pinned });
     const stored = await readAuth(entry.name);
     // Report what the provider actually granted, not what was asked for. They
     // differ more often than not — a provider may drop a scope it does not
@@ -547,10 +609,22 @@ function escapeHtml(s: string): string {
  * meaningful: it lets the SDK apply its own SEP-835 selection, which is right
  * when a provider advertises nothing.
  */
+export type ScopeRequest = {
+  scopes?: string;
+  readOnly?: boolean;
+  allScopes?: boolean;
+  /** What the grant being replaced was narrowed to. */
+  previous?: string;
+  /** The `oauth.scopes` pin in force when `previous` was chosen. */
+  previousPin?: string;
+  /** `oauth.scopes` from the server's config. */
+  pinned?: string;
+};
+
 export function chooseScopes(
   advertised: string[],
-  want: { scopes?: string; readOnly?: boolean; allScopes?: boolean; previous?: string },
-): { scope?: string; warn?: string[] } | { error: string } {
+  want: ScopeRequest,
+): { scope?: string; warn?: string[]; note?: string } | { error: string } {
   // --scopes stays the exact lever and still outranks both of these. But
   // --read-only and --all-scopes are opposites with no defensible precedence,
   // and quietly picking one would hand back a grant of the wrong breadth —
@@ -568,6 +642,43 @@ export function chooseScopes(
     // provider is the one that gets to refuse it.
     const unknown = unknownScopes(requested, advertised);
     return { scope: requested.join(" "), ...(unknown.length ? { warn: unknown } : {}) };
+  }
+
+  // The narrowing a previous grant carried only binds while the pin it was
+  // made under still stands. Edit the pin (or add or remove one) and the next
+  // login follows the config, which is the whole point of editing it.
+  const inherited = (want.previousPin ?? "") === (want.pinned ?? "") ? want.previous : undefined;
+
+  // A pin replaces the advertised list as the set to choose from: it is the
+  // approved subset, and it holds whatever discovery says. The flags still
+  // work, but inside it.
+  const pinned = want.pinned ? parseScopeList(want.pinned) : [];
+  if (pinned.length) {
+    // offline_access is what makes the grant refreshable, and a pin written
+    // from a list of API scopes rarely includes it. Claude Code adds it on the
+    // same condition, so a pin shared between the two behaves the same.
+    const refresh = advertised.includes("offline_access") && !pinned.includes("offline_access");
+    const withRefresh = (scopes: string[]) => (refresh ? [...scopes, "offline_access"] : scopes).join(" ");
+    if (want.allScopes) {
+      return {
+        scope: withRefresh(pinned),
+        note:
+          `oauth.scopes pins this server to ${pinned.join(", ")}, so --all-scopes requests ` +
+          `those. Add a scope there to widen the grant.`,
+      };
+    }
+    if (want.readOnly) {
+      const ro = readOnlyScopes(pinned);
+      if (!ro.length) {
+        return {
+          error:
+            `no read-only scopes are in the pinned set (oauth.scopes: ${pinned.join(", ")}).\n` +
+            `  Authorize with the pinned scopes, or pick explicitly with --scopes.`,
+        };
+      }
+      return { scope: withRefresh(ro) };
+    }
+    return { scope: inherited ?? withRefresh(pinned) };
   }
 
   if (want.allScopes) {
@@ -597,7 +708,7 @@ export function chooseScopes(
     return { scope: ro.join(" ") };
   }
 
-  if (want.previous) return { scope: want.previous };
+  if (inherited) return { scope: inherited };
   return { scope: advertised.length ? advertised.join(" ") : undefined };
 }
 

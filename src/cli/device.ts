@@ -1,5 +1,4 @@
 import {
-  discoverOAuthServerInfo,
   registerClient,
   selectClientAuthMethod,
   selectResourceURL,
@@ -10,7 +9,15 @@ import type {
   OAuthClientInformationMixed,
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { CALLBACK_PORT, DEVICE_GRANT_TYPE, FileTokenStore, readAuth, writeAuth } from "../config/oauth.ts";
+import {
+  CALLBACK_PORT,
+  DEVICE_GRANT_TYPE,
+  FileTokenStore,
+  discoverServerInfo,
+  readAuth,
+  writeAuth,
+} from "../config/oauth.ts";
+import type { OAuthSettings } from "../config/types.ts";
 
 /**
  * RFC 8628 device authorization grant — the login path for a machine with no
@@ -137,11 +144,13 @@ export async function runDeviceFlow(opts: {
   info?: OAuthServerInfo;
   /** The loopback port registered as this client's redirect. Never bound here. */
   port?: number;
+  /** The server entry's `oauth` block: a configured client, port and metadata URL. */
+  settings?: OAuthSettings;
 }): Promise<DeviceLoginResult> {
   const log = opts.log ?? ((line: string) => console.log(line));
   const doFetch = opts.fetchFn ?? fetch;
 
-  const info = opts.info ?? (await discoverOAuthServerInfo(opts.url, { fetchFn: doFetch }));
+  const info = opts.info ?? (await discoverServerInfo(opts.url, opts.settings, doFetch));
   const metadata = info.authorizationServerMetadata;
   const endpoint = deviceEndpoint(metadata);
   if (!endpoint) {
@@ -160,21 +169,32 @@ export async function runDeviceFlow(opts: {
   // to be the real callback port: this client is reused for a browser login if
   // the machine ever gets a display, and a redirect_uri registered on the wrong
   // port cannot be corrected without re-registering. Nothing is bound here.
-  const store = new FileTokenStore(opts.server, opts.port ?? CALLBACK_PORT, () => {
-    throw new Error("unreachable: the device grant does not redirect");
-  });
+  const store = new FileTokenStore(
+    opts.server,
+    opts.port ?? opts.settings?.callbackPort ?? CALLBACK_PORT,
+    () => {
+      throw new Error("unreachable: the device grant does not redirect");
+    },
+    opts.settings,
+    doFetch,
+  );
   const resource = await selectResourceURL(opts.url, store, info.resourceMetadata);
 
-  let client = (await readAuth(opts.server)).clientInformation;
+  // Through the store, so a client named in the server's config is the one used.
+  let client = await store.clientInformation();
   const registeredForDevice = (await readAuth(opts.server)).deviceClient === true;
-  if (!client || !registeredForDevice) {
+  // A configured client is never re-registered: every later connection
+  // refreshes with the configured id, so tokens issued to a freshly registered
+  // one would be unusable the first time they expired.
+  if (!opts.settings?.clientId && (!client || !registeredForDevice)) {
     if (!metadata?.registration_endpoint && !client) {
       return {
         ok: false,
         message:
           `${opts.server} supports the device grant but not dynamic client registration, so it ` +
           `needs an OAuth app you register yourself.\n` +
-          `  Then: autorouter login ${opts.server} --device --client-id <id> [--client-secret <secret>]`,
+          `  Then: autorouter login ${opts.server} --device --client-id <id> [--client-secret <secret>]\n` +
+          `  or set "oauth": { "clientId": "<id>" } on the server in its config.`,
       };
     }
     if (metadata?.registration_endpoint) {
@@ -258,7 +278,7 @@ export async function runDeviceFlow(opts: {
       const tokens = (await res.json()) as OAuthTokens;
       await writeAuth(opts.server, {
         tokens,
-        ...(opts.scope ? { requestedScope: opts.scope } : {}),
+        ...(opts.scope ? { requestedScope: opts.scope, pinnedScope: opts.settings?.scopes } : {}),
       });
       return { ok: true, message: "", grantedScope: tokens.scope ?? opts.scope };
     }
