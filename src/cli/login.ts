@@ -22,9 +22,11 @@ import {
   unknownScopes,
 } from "../config/scopes.ts";
 import type { ServerEntry } from "../config/types.ts";
+import { runLocalLogin } from "./loginLocal.ts";
 
 /**
  * Runs the OAuth authorization-code flow for one server and stores the grant.
+ * A local (stdio) server has no grant to obtain and is handed to loginLocal.ts.
  *
  * The redirect target is a loopback HTTP server started for the duration of the
  * flow. A fixed port is used rather than an ephemeral one because the port is
@@ -67,6 +69,8 @@ export async function runLogin(opts: {
   device?: boolean;
   /** Force the paste-the-code flow: print the URL, read the redirect back in. */
   manual?: boolean;
+  /** Local servers: the sign-in command to run (the argv after a bare `--`). */
+  loginCommand?: string[];
 }): Promise<LoginResult> {
   const resolved = await resolveConfig(opts.cwd);
   const entry = resolved.servers.find((s) => s.name === opts.server);
@@ -75,7 +79,40 @@ export async function runLogin(opts: {
     return { ok: false, message: `Unknown server "${opts.server}". Known: ${names}` };
   }
   if (entry.transport !== "http") {
-    return { ok: false, message: `${entry.name} is a stdio server; OAuth applies to http servers only.` };
+    // Every one of these shapes an OAuth grant. Dropping them silently would
+    // read as though --read-only had restricted a server it never touched.
+    const oauthOnly = (
+      [
+        ["--list-scopes", opts.listScopes],
+        ["--read-only", opts.readOnly],
+        ["--all-scopes", opts.allScopes],
+        ["--scopes", opts.scopes],
+        ["--device", opts.device],
+        ["--manual", opts.manual],
+        ["--client-id", opts.clientId],
+        ["--client-secret", opts.clientSecret],
+      ] as const
+    )
+      .filter(([, set]) => set)
+      .map(([flag]) => flag);
+    if (oauthOnly.length) {
+      return {
+        ok: false,
+        message:
+          `${entry.name} is a local (stdio) server, so ${oauthOnly.join(", ")} ${oauthOnly.length > 1 ? "do" : "does"} not apply — ` +
+          `${oauthOnly.length > 1 ? "those shape" : "that shapes"} an OAuth grant, and a local server signs in through its own command.\n` +
+          `  autorouter login ${entry.name} [-- <sign-in command>]`,
+      };
+    }
+    return await runLocalLogin(entry, { command: opts.loginCommand });
+  }
+  if (opts.loginCommand?.length) {
+    return {
+      ok: false,
+      message:
+        `${entry.name} is an http server and is authorized over OAuth, so a sign-in command after -- does not apply.\n` +
+        `  autorouter login ${entry.name}`,
+    };
   }
   if (opts.listScopes) return await describeScopes(entry);
   // Read before --force wipes the file, so the replacement grant can inherit

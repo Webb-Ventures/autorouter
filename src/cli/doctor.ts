@@ -44,8 +44,8 @@ export async function runDoctor(cwd: string): Promise<string> {
   if (!resolved.servers.length) lines.push("  none discovered");
   for (const s of resolved.servers) {
     const target = s.transport === "http" ? s.url : `${s.command} ${s.args.join(" ")}`.trim();
-    // Auth state is only meaningful for http servers; a stdio server's
-    // credentials are whatever its env block carries.
+    // Auth state is only known for http servers, whose grant the router holds.
+    // A stdio server keeps its own credentials (see cli/loginLocal.ts).
     const auth = s.transport === "http" ? ((await hasAuth(s.name)) ? " (authorized)" : "") : "";
     lines.push(
       `  ${s.name.padEnd(20)} ${s.transport.padEnd(6)} [${s.origin}] ${truncate(target, 70)}${auth}`,

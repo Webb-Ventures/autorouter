@@ -136,7 +136,7 @@ describe("autorouter login", () => {
     }
   });
 
-  test("refuses stdio servers, where OAuth does not apply", async () => {
+  test("refuses OAuth-only flags on a stdio server instead of ignoring them", async () => {
     const { runLogin } = await import("../src/cli/login.ts");
     const cwd = await mkdtemp(join(tmpdir(), "autorouter-cwd-"));
     await Bun.write(
@@ -146,9 +146,10 @@ describe("autorouter login", () => {
     const prevCfg = process.env.AUTOROUTER_CONFIG;
     delete process.env.AUTOROUTER_CONFIG;
     try {
-      const result = await runLogin({ server: "local", cwd });
+      const result = await runLogin({ server: "local", cwd, readOnly: true });
       expect(result.ok).toBe(false);
       expect(result.message).toContain("stdio");
+      expect(result.message).toContain("--read-only");
     } finally {
       if (prevCfg !== undefined) process.env.AUTOROUTER_CONFIG = prevCfg;
       await rm(cwd, { recursive: true, force: true });
