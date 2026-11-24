@@ -20,7 +20,7 @@ import { absPath } from "./util/paths.ts";
 import { workspaceRoot } from "./workspace/root.ts";
 import { cmdAdoptProject, cmdApprove, cmdRepair, cmdRestoreProject, projectFlag } from "./cli/project.ts";
 
-const VERSION = "0.1.0";
+const VERSION = "0.3.2";
 
 const USAGE = `autorouter — one search tool instead of every tool
 
