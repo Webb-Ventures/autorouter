@@ -196,13 +196,27 @@ export function dedupeServers(entries: ServerEntry[]): ServerEntry[] {
     const key = specKey(entry);
     const existing = byKey.get(key);
     if (existing) {
+      // Two registrations of one URL are one server, and its OAuth settings are
+      // usually written in only one of them. Whichever name survives, the
+      // settings must: losing them here would send login back to dynamic
+      // registration for a server that was given a client precisely because it
+      // has none.
+      const oauth =
+        existing.transport === "http" && entry.transport === "http"
+          ? (existing.oauth ?? entry.oauth)
+          : undefined;
       // Prefer the shorter, more canonical name; record both origins.
       if (entry.name.length < existing.name.length) {
         usedNames.delete(existing.name);
-        byKey.set(key, { ...entry, origin: `${existing.origin}+${entry.origin}` });
+        byKey.set(key, {
+          ...entry,
+          ...(oauth ? { oauth } : {}),
+          origin: `${existing.origin}+${entry.origin}`,
+        } as ServerEntry);
         usedNames.add(entry.name);
-      } else if (!existing.origin.includes(entry.origin)) {
-        existing.origin = `${existing.origin}+${entry.origin}`;
+      } else {
+        if (oauth && existing.transport === "http") existing.oauth = oauth;
+        if (!existing.origin.includes(entry.origin)) existing.origin = `${existing.origin}+${entry.origin}`;
       }
       continue;
     }

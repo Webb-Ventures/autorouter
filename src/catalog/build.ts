@@ -51,7 +51,7 @@ export async function buildCatalog(resolved: ResolvedConfig): Promise<Catalog> {
         client = await connect(entry);
         return { entry, caps: await enumerateServer(entry, client) };
       } catch (err) {
-        return { entry, error: authHint(entry.name, err) };
+        return { entry, error: authHint(entry.name, err, entry.transport === "http" ? entry.oauth : undefined) };
       } finally {
         try {
           await client?.close();

@@ -8,9 +8,9 @@ import { authHint } from "../config/oauth.ts";
  * authHint() had nothing to add — an unrelated failure should not be reworded
  * into something that looks like an auth problem.
  */
-function hinted(server: string, err: unknown): Error {
+function hinted(server: string, err: unknown, entry?: ServerEntry): Error {
   const raw = err instanceof Error ? err.message : String(err);
-  const hint = authHint(server, err);
+  const hint = authHint(server, err, entry?.transport === "http" ? entry.oauth : undefined);
   return hint === raw ? (err instanceof Error ? err : new Error(raw)) : new Error(hint);
 }
 
@@ -75,7 +75,7 @@ export class ConnectionPool {
       this.clients.delete(serverName);
       // A grant can expire between a reindex and a call, so the actionable
       // message has to exist on this path too, not just at index time.
-      throw hinted(serverName, err);
+      throw hinted(serverName, err, entry);
     }
   }
 
@@ -92,7 +92,7 @@ export class ConnectionPool {
     try {
       return await run(client);
     } catch (err) {
-      throw hinted(serverName, err);
+      throw hinted(serverName, err, this.byName.get(serverName));
     }
   }
 

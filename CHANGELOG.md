@@ -27,6 +27,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The `oauth` block of an http server entry is read, in the shape Claude Code
+  uses in `.mcp.json` and `~/.claude.json`. It was copied into the router's
+  config by `adopt` and then ignored, so a server without dynamic client
+  registration could only be authorized by retyping `--client-id` on every
+  login.
+  - `clientId` and `clientSecret` name the OAuth app. `${VAR}` is expanded, and
+    `login` names a variable that is not set instead of sending it literally.
+  - `callbackPort` sets the loopback redirect port.
+  - `authServerMetadataUrl` (https only) replaces the discovery chain, for
+    login and for background reconnects.
+  - `scopes` pins what a login requests. `--read-only` narrows inside the pin,
+    `--all-scopes` cannot widen past it, and an `insufficient_scope` failure
+    points at the pin rather than at `--all-scopes`.
+
+  The configured client outranks a stored registration, and a `--client-id`
+  that contradicts it is refused. Duplicate registrations of one URL keep the
+  block whichever name survives.
 - `autorouter login` works for local (stdio) servers, which it used to refuse.
   `autorouter login <server> -- <command>` runs the server's own sign-in
   command (`-- railway login`) attached to the terminal, with the server's

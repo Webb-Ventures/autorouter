@@ -1,3 +1,23 @@
+/**
+ * The `oauth` block of an http server entry, in the shape Claude Code reads
+ * from `.mcp.json` and `~/.claude.json`.
+ *
+ * `clientSecret` is the one field Claude Code does not keep here — it puts the
+ * secret in the system keychain, which is a store the router must not read. A
+ * secret written in the config (ideally as `${VAR}`) is honoured instead.
+ */
+export type OAuthSettings = {
+  /** A pre-registered OAuth client, for servers without dynamic registration. */
+  clientId?: string;
+  clientSecret?: string;
+  /** Loopback port for the redirect, matching a pre-registered redirect URI. */
+  callbackPort?: number;
+  /** Authorization server metadata to use instead of the discovery chain. */
+  authServerMetadataUrl?: string;
+  /** Space-separated scopes to request, overriding whatever is advertised. */
+  scopes?: string;
+};
+
 /** How a downstream MCP server is launched or reached. */
 export type ServerSpec =
   | {
@@ -18,6 +38,7 @@ export type ServerSpec =
       transport: "http";
       url: string;
       headers?: Record<string, string>;
+      oauth?: OAuthSettings;
     };
 
 export type ServerEntry = ServerSpec & {

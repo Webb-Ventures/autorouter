@@ -96,6 +96,9 @@ Options
   --port N       login: loopback callback port (default 33418; keep it stable)
   --client-id ID login: use a pre-registered OAuth client (servers without RFC 7591)
   --client-secret S  login: its secret, if it is a confidential client
+                 Both, with the callback port and scopes, can live in the
+                 server entry instead: "oauth": { "clientId", "clientSecret",
+                 "callbackPort", "authServerMetadataUrl", "scopes" }
   --read-only    login: request only the scopes that cannot mutate anything
   --all-scopes   login: request everything the server advertises, dropping
                  any narrowing the previous grant carried
