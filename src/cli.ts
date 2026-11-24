@@ -11,6 +11,7 @@ import { runLogin, summarizeScopes } from "./cli/login.ts";
 import { runUpdate } from "./cli/update.ts";
 import { clearAuth, hasAuth, readAuth } from "./config/oauth.ts";
 import { resolveConfig } from "./config/resolve.ts";
+import type { ServerEntry } from "./config/types.ts";
 import { renderCapability, renderRouteResult, oneLine } from "./server/render.ts";
 import type { CapabilityKind } from "./catalog/types.ts";
 import { loadCatalog } from "./catalog/build.ts";
@@ -40,6 +41,12 @@ const USAGE = `autorouter — one search tool instead of every tool
   autorouter login [server]            Authorize an OAuth server (opens a browser,
                                        or prints a code on a headless box);
                                        with no argument, lists what needs one
+  autorouter login <server> -- <cmd>   Sign a local (stdio) server in with its
+                                       own command (-- railway login), then
+                                       check it starts. Without -- <cmd>, uses
+                                       the server's "login" config key, or just
+                                       starts it in the foreground so a
+                                       first-run browser sign-in can finish
   autorouter logout <server>           Forget a stored grant
   autorouter add <name> --url URL      Register a server with the router directly
   autorouter add <name> -- <cmd> ...   Same, for a stdio server
@@ -109,7 +116,8 @@ editing anything committed; set "autoAdoptProject": false to keep that manual.
 Servers like Datadog and Supabase hold no credentials in their config — the
 working token is an OAuth grant the harness keeps privately. The router obtains
 its own grant instead of borrowing one, so \`autorouter login <server>\` is a
-one-time step before those can be adopted.
+one-time step before those can be adopted. Local (stdio) servers keep their own
+credentials; \`login\` runs their sign-in command in your terminal instead.
 `;
 
 async function main(argv: string[]): Promise<number> {
@@ -170,7 +178,7 @@ async function main(argv: string[]): Promise<number> {
       return await cmdInit(flags);
 
     case "login":
-      return await cmdLogin(positionals[0], flags);
+      return await cmdLogin(positionals[0], flags, rest);
 
     case "logout":
       return await cmdLogout(positionals[0]);
@@ -275,14 +283,26 @@ async function cmdReindex(): Promise<void> {
   await router.close();
 }
 
-async function cmdLogin(server: string | undefined, flags: Flags): Promise<number> {
+/** What `login` with no argument says about local servers, which hold no grant to list. */
+function printLocalLoginHelp(servers: ServerEntry[]): void {
+  const local = servers.filter((s) => s.transport === "stdio");
+  if (!local.length) return;
+  console.log("\nLocal (stdio) servers sign in through their own command, not OAuth:");
+  console.log("  autorouter login <server> [-- <sign-in command>]      e.g. -- railway login");
+  for (const s of local) {
+    if (s.transport === "stdio" && s.login?.length) console.log(`  ${s.name}: ${s.login.join(" ")}`);
+  }
+}
+
+async function cmdLogin(server: string | undefined, flags: Flags, rest: string[] = []): Promise<number> {
   if (!server) {
     // Without an argument, show which http servers still need a grant rather
     // than just complaining — that list is the whole reason to run this.
     const resolved = await resolveConfig(process.cwd());
     const http = resolved.servers.filter((s) => s.transport === "http");
     if (!http.length) {
-      console.log("No http servers configured; OAuth login does not apply.");
+      console.log("No http servers configured, so there is no OAuth grant to obtain.");
+      printLocalLoginHelp(resolved.servers);
       return 0;
     }
     const states = await Promise.all(
@@ -314,6 +334,7 @@ async function cmdLogin(server: string | undefined, flags: Flags): Promise<numbe
       console.log(`\n${pending.length} need a grant; each is a separate authorization:`);
       for (const s of pending) console.log(`  autorouter login ${s.name}`);
     }
+    printLocalLoginHelp(resolved.servers);
     return 1;
   }
   const port = flags.port ? Number(flags.port) : undefined;
@@ -332,6 +353,7 @@ async function cmdLogin(server: string | undefined, flags: Flags): Promise<numbe
     listScopes: Boolean(flags["list-scopes"]),
     device: Boolean(flags.device),
     manual: Boolean(flags.manual),
+    loginCommand: rest.length ? rest : undefined,
   });
   console.log(result.message);
   if (!result.authorized) return result.ok ? 0 : 1;

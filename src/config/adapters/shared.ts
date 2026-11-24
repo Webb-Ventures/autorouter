@@ -16,6 +16,8 @@ export type RawServer = {
   enabled?: boolean;
   startup_timeout_sec?: number;
   startupTimeoutSec?: number;
+  /** Sign-in command for a stdio server: an argv, or one whitespace-split string. */
+  login?: string | string[];
 };
 
 /**
@@ -93,7 +95,23 @@ export function normalizeServer(
     env: expandMap(raw.env),
     cwd: raw.cwd ? absPath(raw.cwd) : undefined,
     startupTimeoutSec: raw.startup_timeout_sec ?? raw.startupTimeoutSec,
+    login: loginCommand(raw.login, origin),
   };
+}
+
+/**
+ * The sign-in command an entry declares, or undefined.
+ *
+ * Honoured from the router's own config and nowhere else. A repo's `.mcp.json`
+ * is approved by pinning its exact command and args (see workspace/trust.ts),
+ * and a `login` key sits outside that pin — reading it from there would let a
+ * repository choose what `autorouter login` executes.
+ */
+function loginCommand(raw: unknown, origin: string): string[] | undefined {
+  if (origin !== "config" && origin !== "config:project") return undefined;
+  const argv = typeof raw === "string" ? raw.trim().split(/\s+/) : Array.isArray(raw) ? raw.map(String) : [];
+  const expanded = argv.filter(Boolean).map(expandEnv);
+  return expanded.length ? expanded : undefined;
 }
 
 /**

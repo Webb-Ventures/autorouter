@@ -13,7 +13,19 @@ import { serializeRefresh } from "../../config/refresh.ts";
 const CLIENT_INFO = { name: "autorouter", version: "0.1.0" };
 const DEFAULT_TIMEOUT_MS = 30_000;
 
-export async function connect(entry: ServerEntry, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<Client> {
+export async function connect(
+  entry: ServerEntry,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  opts: {
+    /**
+     * Someone is watching: a stdio server's stderr goes to the terminal, and
+     * `timeoutMs` is a floor rather than something startupTimeoutSec replaces.
+     * `autorouter login` uses this so a server that signs in on first run can
+     * print its URL and wait for a human.
+     */
+    interactive?: boolean;
+  } = {},
+): Promise<Client> {
   // Checked here rather than at config time because every path that spawns a
   // server — serve, re-index, adopt's probe, add — funnels through connect().
   if (entry.transport === "stdio") {
@@ -27,17 +39,23 @@ export async function connect(entry: ServerEntry, timeoutMs = DEFAULT_TIMEOUT_MS
 
   const client = new Client(CLIENT_INFO, { capabilities: {} });
   const transport =
-    entry.transport === "http" ? httpTransport(entry) : stdioTransport(entry);
+    entry.transport === "http" ? httpTransport(entry) : stdioTransport(entry, opts.interactive);
 
-  const timeout = entry.transport === "stdio" && entry.startupTimeoutSec
-    ? entry.startupTimeoutSec * 1000
-    : timeoutMs;
+  const startup = entry.transport === "stdio" && entry.startupTimeoutSec ? entry.startupTimeoutSec * 1000 : 0;
+  const timeout = opts.interactive ? Math.max(timeoutMs, startup) : startup || timeoutMs;
 
-  await withTimeout(client.connect(transport), timeout, `connect to ${entry.name}`);
+  try {
+    await withTimeout(client.connect(transport), timeout, `connect to ${entry.name}`);
+  } catch (err) {
+    // A timed-out stdio server is still running; closing the transport is what
+    // stops it, and nothing else holds a reference to do so later.
+    await transport.close().catch(() => {});
+    throw err;
+  }
   return client;
 }
 
-function stdioTransport(entry: Extract<ServerEntry, { transport: "stdio" }>) {
+function stdioTransport(entry: Extract<ServerEntry, { transport: "stdio" }>, interactive = false) {
   return new StdioClientTransport({
     command: entry.command,
     args: entry.args,
@@ -45,7 +63,7 @@ function stdioTransport(entry: Extract<ServerEntry, { transport: "stdio" }>) {
     // Inherit the parent env so PATH-dependent commands (uvx, npx) resolve,
     // which is the single most common cause of stdio servers failing to start.
     env: { ...(process.env as Record<string, string>), ...(entry.env ?? {}) },
-    stderr: "pipe",
+    stderr: interactive ? "inherit" : "pipe",
   });
 }
 

@@ -8,6 +8,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A stdio server that timed out while connecting is now stopped. It was left
+  running, one more copy per reindex.
 - Hidden skills are invocable by Claude again. Adopt hid them as
   `skillOverrides: "user-invocable-only"`, which Claude Code enforces by
   rejecting every Skill-tool call ("Skill … is disabled for model invocation")
@@ -25,6 +27,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `autorouter login` works for local (stdio) servers, which it used to refuse.
+  `autorouter login <server> -- <command>` runs the server's own sign-in
+  command (`-- railway login`) attached to the terminal, with the server's
+  `env` and `cwd`, then checks the server starts and reindexes. With no
+  command it starts the server in the foreground, stderr visible, and waits up
+  to five minutes so a first-run browser sign-in can finish. A `login` key on
+  a server entry in the router's config saves retyping the command; it is
+  ignored in harness and `.mcp.json` entries. OAuth-only flags on a local
+  server are refused by name. The router stores no credentials for these.
 - `autorouter audit`: the real context bill, read from Claude Code's
   transcripts. It uses the usage figures recorded for each call to report:
   - average context per call, input processed and cache share

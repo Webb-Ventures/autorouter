@@ -546,6 +546,7 @@ autorouter login                                    # which servers need a grant
 autorouter login remote-server                      # authorize one (opens a browser)
 autorouter login remote-server --device             # headless: enter a code elsewhere
 autorouter login remote-server --no-reindex         # authorize, index later
+autorouter login local-server -- railway login      # local server: run its own sign-in
 autorouter logout remote-server                     # forget a stored grant
 ```
 
@@ -661,6 +662,43 @@ each stored grant actually covers.
 Until a server has a grant, `adopt` refuses to move it or to disable the plugin
 that supplies it. Moving a server the router cannot reach would delete a working
 capability, so `doctor` and `adopt` both print the exact `login` command instead.
+
+### Local (stdio) servers
+
+A local server has no grant for the router to hold. It keeps its own
+credentials wherever its vendor put them and signs in on its own terms: a
+companion command (`railway login`, `firebase login`), or a browser flow it
+starts the first time it runs. The router launches servers in the background
+with their output captured, which is the one place neither can happen — so
+`login` does it in your terminal instead:
+
+```sh
+autorouter login railway -- railway login   # run the sign-in command, then check the server starts
+autorouter login gmail                      # no command: start it in the foreground and wait
+```
+
+With a command, `login` runs it attached to the terminal (with the server's own
+`env` and `cwd`, so it signs in to the profile the server reads), and stops
+there if it fails. Without one, it starts the server with its stderr visible and
+waits up to five minutes for it to answer, which is enough to finish a sign-in
+the server opens by itself. Either way a server that answers is followed by the
+same reindex as an OAuth login.
+
+To avoid retyping the command, keep it on the entry in the router's config:
+
+```json
+{ "servers": { "railway": { "command": "railway", "args": ["mcp"], "login": ["railway", "login"] } } }
+```
+
+`login` is read from the router's own config only. A repo's `.mcp.json` is
+approved by pinning its command and arguments, so a `login` key there is
+ignored rather than run.
+
+The router stores nothing for these servers, so there is nothing for `logout`
+to forget (use the server's own sign-out) and the scope flags (`--read-only`,
+`--scopes`, `--device`, …) are refused rather than silently dropped. A server
+that starts is all the router can verify; whether it is signed in is something
+only its tools can say.
 
 ## The trade-off, stated plainly
 

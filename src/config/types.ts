@@ -7,6 +7,12 @@ export type ServerSpec =
       env?: Record<string, string>;
       cwd?: string;
       startupTimeoutSec?: number;
+      /**
+       * The command that signs this server in, e.g. ["railway", "login"]. A
+       * local server holds its own credentials, so `autorouter login` runs this
+       * rather than an OAuth flow. Read from the router's own config only.
+       */
+      login?: string[];
     }
   | {
       transport: "http";
