@@ -11,14 +11,51 @@
 /**
  * Scope names that grant mutation. Best-effort: it recognises the conventions
  * providers actually use (`projects:write`, `write:issues`, `admin.foo`,
- * `mcp_all`) but cannot see through an opaque name like GitHub's `repo`, which
- * grants write while reading as neutral. `--scopes` is the exact lever when the
- * heuristic guesses wrong; this only decides what `--read-only` keeps.
+ * `mcp_all`, `gmail.send`) but cannot see through an opaque name like GitHub's
+ * `repo`, which grants write while reading as neutral. `--scopes` is the exact
+ * lever when the heuristic guesses wrong; this only decides what `--read-only`
+ * keeps. URL-shaped scopes do not get this benefit of the doubt — see
+ * isReadOnlyScope.
  */
-const MUTATING = /(^|[:._\-\/])(write|admin|manage|delete|destroy|create|update|modify|readwrite|rw|full|all)([:._\-\/]|$)/i;
+const MUTATING = /(^|[:._\-\/])(write|admin|manage|delete|destroy|create|update|modify|readwrite|rw|full|all|send|compose|insert|import|remove|edit)([:._\-\/]|$)/i;
+
+/** `scheme://host/rest` — the shape Google, Microsoft and Entra app scopes take. */
+const URL_SCOPE = /^[a-z][a-z0-9+.-]*:\/\/([^\/?#]*)(.*)$/i;
+
+/** A delimited `read` / `readonly` / `read-only` / `read_only` in a URL scope's path. */
+const READ_MARKER = /(^|[:._\-\/])(read|readonly)([:._\-\/]|$)/i;
+
+/**
+ * Google's own convention, which is exact rather than a guess: under
+ * `https://www.googleapis.com/auth/` a scope reads only when its name ends in
+ * `.readonly` (a few older APIs spell it `.read`, `.read-only`, `.read_only`).
+ * Every other name is the read-write form of that product — `gmail.labels`
+ * creates and deletes labels, `gmail.messages` trashes mail — however neutral
+ * it looks.
+ */
+const GOOGLE_AUTH = /^https:\/\/www\.googleapis\.com\/auth\/(.+)$/;
+const GOOGLE_READ_SUFFIX = /\.(readonly|read|read[-_]only)$/;
+/** The Google names that read without saying so. */
+const GOOGLE_READ_ONLY = new Set(["gmail.metadata", "userinfo.email", "userinfo.profile"]);
 
 export function isReadOnlyScope(scope: string): boolean {
-  return !MUTATING.test(scope);
+  const url = URL_SCOPE.exec(scope);
+  if (!url) return !MUTATING.test(scope);
+
+  const google = GOOGLE_AUTH.exec(scope);
+  if (google) {
+    const name = google[1]!;
+    return GOOGLE_READ_ONLY.has(name) || GOOGLE_READ_SUFFIX.test(name);
+  }
+
+  // Any other URL scope has to say it is read-only, in its path — the host
+  // names the provider, not the grant. A bare product URL is the opposite of
+  // reassuring: `https://mail.google.com/` is the whole mailbox, permanent
+  // delete included, and `https://graph.microsoft.com/.default` is everything
+  // the app was ever consented for. Absence of a mutating word proves nothing
+  // here, so unmarked means write; a `--read-only` that comes back too narrow
+  // is recoverable, one that quietly includes full access is not.
+  return READ_MARKER.test(url[2]!) && !MUTATING.test(scope);
 }
 
 /**
