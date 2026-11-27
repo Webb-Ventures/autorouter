@@ -6,13 +6,21 @@ import { CATALOG_VERSION, matchesPattern } from "./types.ts";
 import { collectSkills } from "./providers/skills.ts";
 import { collectPluginAssets } from "./providers/plugins.ts";
 import { connect, enumerateServer } from "./providers/mcp.ts";
-import { cacheDir } from "../util/paths.ts";
+import { cacheDir, claudeInstall, type ClaudeInstall } from "../util/paths.ts";
 import { ensureDir, readText, writeText } from "../util/fs.ts";
 import { authHint, authPath } from "../config/oauth.ts";
 
-export function catalogPath(cwd: string): string {
+/**
+ * One catalog per working directory and Claude Code install. Two installs open
+ * in the same repo see different skills, plugins and servers; sharing a file
+ * would have each router rebuild over the other's catalog on every start.
+ */
+export function catalogPath(cwd: string, install: ClaudeInstall = claudeInstall()): string {
   const slug = cwd.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_|_$/g, "").slice(-80);
-  return join(cacheDir(), `catalog-${slug}.json`);
+  const suffix = install.isDefault
+    ? ""
+    : `@${install.dir.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_|_$/g, "").slice(-40)}`;
+  return join(cacheDir(), `catalog-${slug}${suffix}.json`);
 }
 
 export async function buildCatalog(resolved: ResolvedConfig): Promise<Catalog> {
@@ -35,11 +43,12 @@ export async function buildCatalog(resolved: ResolvedConfig): Promise<Catalog> {
 
   const skills = await collectSkills(config.skillPaths, cwd, {
     includePlugins: config.import.includes("plugins"),
+    install: resolved.install,
   });
   capabilities.push(...skills.capabilities);
   sourceFiles.push(...skills.sources);
 
-  const pluginAssets = await collectPluginAssets();
+  const pluginAssets = await collectPluginAssets(resolved.install);
   capabilities.push(...pluginAssets.capabilities);
   sourceFiles.push(...pluginAssets.sources);
 
@@ -117,8 +126,8 @@ async function hasAccessToken(path: string): Promise<boolean> {
   }
 }
 
-export async function loadCatalog(cwd: string): Promise<Catalog | null> {
-  const text = await readText(catalogPath(cwd));
+export async function loadCatalog(cwd: string, install?: ClaudeInstall): Promise<Catalog | null> {
+  const text = await readText(catalogPath(cwd, install));
   if (!text) return null;
   try {
     const catalog = JSON.parse(text) as Catalog;

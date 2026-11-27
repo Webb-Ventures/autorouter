@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import type { ServerEntry } from "../types.ts";
 import { normalizeServer, type RawServer } from "./shared.ts";
-import { homeDir, readJson } from "../../util/paths.ts";
+import { claudeInstall, readJson, type ClaudeInstall } from "../../util/paths.ts";
 import { mcpjsonApproval } from "../../workspace/trust.ts";
 
 type ClaudeConfig = {
@@ -10,37 +10,42 @@ type ClaudeConfig = {
 };
 
 /**
- * Claude Code keeps global servers at ~/.claude.json:mcpServers and per-project
+ * Claude Code keeps global servers at ~/.claude.json:mcpServers (or, for an
+ * install with CLAUDE_CONFIG_DIR set, <dir>/.claude.json) and per-project
  * servers under projects[<cwd>].mcpServers. Project-local .mcp.json is checked
  * into repos, so its servers are only read when Claude Code itself would run
  * them (see workspace/trust.ts) — the router must not launch a cloned repo's
  * commands just because it was started there. Those come back tagged
  * "claude:mcp.json" so adoption can tell them apart from private entries.
  */
-export async function loadClaude(cwd: string): Promise<ServerEntry[]> {
+export async function loadClaude(
+  cwd: string,
+  install: ClaudeInstall = claudeInstall(),
+): Promise<ServerEntry[]> {
   const out: ServerEntry[] = [];
   const push = (name: string, raw: RawServer) => {
     const e = normalizeServer(name, raw, "claude");
     if (e) out.push(e);
   };
 
-  const global = await readJson<ClaudeConfig>(join(homeDir(), ".claude.json"));
+  const global = await readJson<ClaudeConfig>(install.claudeJson);
   for (const [name, raw] of Object.entries(global?.mcpServers ?? {})) push(name, raw);
   for (const [name, raw] of Object.entries(global?.projects?.[cwd]?.mcpServers ?? {})) push(name, raw);
 
-  out.push(...(await loadMcpjson(cwd)).filter((e) => e.approved).map((e) => e.entry));
+  out.push(...(await loadMcpjson(cwd, install)).filter((e) => e.approved).map((e) => e.entry));
   return out;
 }
 
 /** Every server in `<cwd>/.mcp.json`, with whether the router may launch it. */
 export async function loadMcpjson(
   cwd: string,
+  install: ClaudeInstall = claudeInstall(),
 ): Promise<{ entry: ServerEntry; approved: boolean }[]> {
   const local = await readJson<ClaudeConfig>(join(cwd, ".mcp.json"));
   const entries = Object.entries(local?.mcpServers ?? {})
     .map(([name, raw]) => normalizeServer(name, raw, "claude:mcp.json"))
     .filter((e): e is ServerEntry => Boolean(e));
   if (!entries.length) return [];
-  const approval = await mcpjsonApproval(cwd);
+  const approval = await mcpjsonApproval(cwd, install);
   return entries.map((entry) => ({ entry, approved: approval.approved(entry) }));
 }

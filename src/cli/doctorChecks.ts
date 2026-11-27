@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { homeDir, readJson } from "../util/paths.ts";
+import { claudeInstall, claudeSettingsPath, readJson, type ClaudeInstall } from "../util/paths.ts";
 import { readText } from "../util/fs.ts";
 import { run } from "../util/proc.ts";
 import { median, type HookRun } from "../util/transcripts.ts";
@@ -20,17 +20,20 @@ export type ClaudeSettings = {
 };
 
 /** Claude Code's settings files that apply in `cwd`, lowest precedence first. */
-export function settingsFiles(cwd: string): string[] {
+export function settingsFiles(cwd: string, install: ClaudeInstall = claudeInstall()): string[] {
   return [
-    join(homeDir(), ".claude", "settings.json"),
+    claudeSettingsPath(install),
     join(cwd, ".claude", "settings.json"),
     join(cwd, ".claude", "settings.local.json"),
   ];
 }
 
-export async function readSettingsFiles(cwd: string): Promise<{ file: string; settings: ClaudeSettings }[]> {
+export async function readSettingsFiles(
+  cwd: string,
+  install: ClaudeInstall = claudeInstall(),
+): Promise<{ file: string; settings: ClaudeSettings }[]> {
   const out: { file: string; settings: ClaudeSettings }[] = [];
-  for (const file of settingsFiles(cwd)) {
+  for (const file of settingsFiles(cwd, install)) {
     const settings = await readJson<ClaudeSettings>(file);
     if (settings && typeof settings === "object") out.push({ file, settings });
   }
@@ -144,9 +147,9 @@ export function ccServerName(routerName: string): string {
 export type StaleRef = { file: string; line: number; reference: string; server: string; suggestion: string };
 
 /** Files whose instructions are loaded into every session in `cwd`. */
-export function memoryFiles(cwd: string): string[] {
+export function memoryFiles(cwd: string, install: ClaudeInstall = claudeInstall()): string[] {
   return [
-    join(homeDir(), ".claude", "CLAUDE.md"),
+    join(install.dir, "CLAUDE.md"),
     join(cwd, "CLAUDE.md"),
     join(cwd, "CLAUDE.local.md"),
     join(cwd, ".claude", "CLAUDE.md"),
@@ -202,13 +205,14 @@ export async function claudeDirectServers(
   cwd: string,
   settings: { settings: ClaudeSettings }[],
   injected: string[],
+  install: ClaudeInstall = claudeInstall(),
 ): Promise<Set<string>> {
   const direct = new Set<string>(injected);
   type ClaudeJson = {
     mcpServers?: Record<string, unknown>;
     projects?: Record<string, { mcpServers?: Record<string, unknown> }>;
   };
-  const global = await readJson<ClaudeJson>(join(homeDir(), ".claude.json"));
+  const global = await readJson<ClaudeJson>(install.claudeJson);
   for (const name of Object.keys(global?.mcpServers ?? {})) direct.add(name);
   for (const name of Object.keys(global?.projects?.[cwd]?.mcpServers ?? {})) direct.add(name);
   const local = await readJson<ClaudeJson>(join(cwd, ".mcp.json"));
@@ -234,10 +238,13 @@ export function expandDirect(direct: Set<string>, routed: string[]): Set<string>
   return out;
 }
 
-export async function readMemoryDocs(cwd: string): Promise<{ file: string; text: string }[]> {
+export async function readMemoryDocs(
+  cwd: string,
+  install: ClaudeInstall = claudeInstall(),
+): Promise<{ file: string; text: string }[]> {
   const out: { file: string; text: string }[] = [];
   const seen = new Set<string>();
-  for (const file of memoryFiles(cwd)) {
+  for (const file of memoryFiles(cwd, install)) {
     if (seen.has(file)) continue;
     seen.add(file);
     const text = await readText(file);

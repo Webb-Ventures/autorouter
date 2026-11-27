@@ -8,6 +8,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `adopt --target claude` under `CLAUDE_CONFIG_DIR` edited `~/.claude` and
+  `~/.claude.json` instead of the install it ran in.
 - A stdio server that timed out while connecting is now stopped. It was left
   running, one more copy per reindex.
 - Hidden skills are invocable by Claude again. Adopt hid them as
@@ -27,6 +29,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- More than one Claude Code install per machine. Every Claude path follows
+  `CLAUDE_CONFIG_DIR` the way Claude Code does: `settings.json`, `skills/`,
+  `plugins/`, transcripts and `CLAUDE.md` come from that dir, and so does
+  `.claude.json` (the default install keeps it at `~/.claude.json`). A router
+  started under another install indexes that install's skills, servers and
+  plugins, and keeps a catalog of its own. `adopt`/`restore --target claude`
+  take `--config-dir <dir>` (repeatable or comma-separated) and
+  `--all-claude-dirs`. Each install gets its own backup and restores on its
+  own. `doctor` lists every install, whether the router is registered in it,
+  and what each still loads.
 - The `oauth` block of an http server entry is read, in the shape Claude Code
   uses in `.mcp.json` and `~/.claude.json`. It was copied into the router's
   config by `adopt` and then ignored, so a server without dynamic client
