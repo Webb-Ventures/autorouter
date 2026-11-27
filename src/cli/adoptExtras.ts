@@ -3,6 +3,7 @@ import { exists, readText, writeText } from "../util/fs.ts";
 import { claudeInstall, claudeSettingsPath, stripJsonComments, type ClaudeInstall } from "../util/paths.ts";
 import { listInstalledPlugins } from "../config/adapters/plugins.ts";
 import { collectSkills } from "../catalog/providers/skills.ts";
+import { readPluginContents, describeUnroutable } from "../config/adapters/pluginContents.ts";
 
 /**
  * Moving MCP servers behind the router only recovers part of the context.
@@ -53,8 +54,10 @@ export function settingsPath(install: ClaudeInstall = claudeInstall()): string {
 
 /**
  * A plugin is only safe to disable once the router can reach everything it
- * contributed. That means its MCP servers must already be adopted; otherwise
- * disabling the plugin deletes capabilities outright instead of routing them.
+ * contributed. That means its MCP servers must already be adopted, and it must
+ * contribute nothing the router has no equivalent for (LSP servers, hooks,
+ * agents, commands, ...); otherwise disabling the plugin deletes capabilities
+ * outright instead of routing them.
  */
 export async function planExtras(opts: {
   cwd: string;
@@ -78,7 +81,14 @@ export async function planExtras(opts: {
   const keepPlugins = new Set(opts.keepPlugins);
 
   const plugins = await listInstalledPlugins(install);
-  const pluginByName = new Map(plugins.map((p) => [p.name, p]));
+
+  // Skills the router can see, collected up front: a plugin may only be
+  // disabled for its skills when the router actually indexes them.
+  const { capabilities } = await collectSkills(opts.skillPaths, opts.cwd, { includePlugins: true, install });
+  const indexedSkills = new Map<string, number>();
+  for (const cap of capabilities) {
+    if (cap.origin === "plugin" && cap.server) indexedSkills.set(cap.server, (indexedSkills.get(cap.server) ?? 0) + 1);
+  }
 
   // Disable whole plugins first: a disabled plugin takes its own skills with
   // it, so listing those skills separately would be noise.
@@ -92,12 +102,25 @@ export async function planExtras(opts: {
       untouched.add(plugin.name);
       continue;
     }
+    const contents = await readPluginContents(plugin, install);
+    // LSP servers, hooks, agents, commands and the rest have no routed
+    // equivalent: disabling the plugin deletes them rather than moving them.
+    const lost = contents.unroutable.length ? describeUnroutable(contents.unroutable) : null;
     if (settings.enabledPlugins?.[plugin.key] === false) {
-      plan.skipped.push(`plugin ${plugin.name} (already disabled)`);
+      plan.skipped.push(
+        lost
+          ? `plugin ${plugin.name} (already disabled, but it contributes ${lost}, which the router cannot stand in for — ` +
+              `to get them back, set enabledPlugins["${plugin.key}"] to true in ${file})`
+          : `plugin ${plugin.name} (already disabled)`,
+      );
       disabledPluginNames.add(plugin.name);
       continue;
     }
-    const servers = await pluginServerNames(plugin.root);
+    if (lost) {
+      plan.skipped.push(`plugin ${plugin.name} (contributes ${lost}, which the router cannot stand in for)`);
+      continue;
+    }
+    const servers = contents.servers;
     // An unreachable server is one the router cannot stand in for. Disabling
     // its plugin would take away a server that currently works — the same
     // hazard the server-move path already refuses, applied one level up.
@@ -129,10 +152,19 @@ export async function planExtras(opts: {
       );
       continue;
     }
+    const skills = indexedSkills.get(plugin.name) ?? 0;
+    if (!servers.length && !skills) {
+      // Nothing for the router to take over, so disabling saves no context.
+      plan.skipped.push(`plugin ${plugin.name} (contributes no MCP servers or skills — nothing to route)`);
+      untouched.add(plugin.name);
+      continue;
+    }
     plan.plugins.push({
       id: plugin.key,
       name: plugin.name,
-      reason: servers.length ? `${servers.length} server(s) already routed` : "skills only",
+      reason: servers.length
+        ? `${servers.length} server(s) already routed${skills ? `, ${skills} skill(s) indexed` : ""}`
+        : `skills only — the router indexes its ${skills} skill(s)`,
     });
     disabledPluginNames.add(plugin.name);
   }
@@ -142,7 +174,6 @@ export async function planExtras(opts: {
   // user settings: a project skill hidden here would hide every same-named
   // skill in every repo. Project skills are hidden per repo instead
   // (workspace/project.ts).
-  const { capabilities } = await collectSkills(opts.skillPaths, opts.cwd, { includePlugins: true, install });
   for (const cap of capabilities) {
     if (cap.origin === "project") continue;
     if (cap.server && (disabledPluginNames.has(cap.server) || untouched.has(cap.server))) continue;
@@ -190,31 +221,7 @@ export async function pluginsWithServers(install: ClaudeInstall = claudeInstall(
 > {
   const out: { key: string; name: string; servers: string[] }[] = [];
   for (const plugin of await listInstalledPlugins(install)) {
-    out.push({ key: plugin.key, name: plugin.name, servers: await pluginServerNames(plugin.root) });
+    out.push({ key: plugin.key, name: plugin.name, servers: (await readPluginContents(plugin, install)).servers });
   }
   return out;
-}
-
-/** Server names a plugin contributes, read the same way loadPluginServers does. */
-async function pluginServerNames(root: string): Promise<string[]> {
-  const manifestText = await readText(join(root, ".claude-plugin", "plugin.json"));
-  if (!manifestText) return [];
-  let manifest: { mcpServers?: string | Record<string, unknown> };
-  try {
-    manifest = JSON.parse(stripJsonComments(manifestText));
-  } catch {
-    return [];
-  }
-  if (!manifest.mcpServers) return [];
-  if (typeof manifest.mcpServers !== "string") return Object.keys(manifest.mcpServers);
-
-  const rel = manifest.mcpServers.replace(/^\.\//, "");
-  const text = await readText(join(root, rel));
-  if (!text) return [];
-  try {
-    const loaded = JSON.parse(stripJsonComments(text));
-    return Object.keys(loaded.mcpServers ?? loaded ?? {});
-  } catch {
-    return [];
-  }
 }
