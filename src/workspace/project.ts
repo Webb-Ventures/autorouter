@@ -2,7 +2,7 @@ import { join, resolve } from "node:path";
 import { ensureDir, exists, readText, writeText } from "../util/fs.ts";
 import { homeDir, readJson, stripJsonComments } from "../util/paths.ts";
 import { run } from "../util/proc.ts";
-import { resolveConfig } from "../config/resolve.ts";
+import { resolveConfig, type ResolvedConfig } from "../config/resolve.ts";
 import { loadMcpjson } from "../config/adapters/claude.ts";
 import { collectSkills } from "../catalog/providers/skills.ts";
 import { isHome } from "./root.ts";
@@ -62,11 +62,15 @@ export function localSettingsPath(root: string): string {
   return join(resolve(root), ".claude", "settings.local.json");
 }
 
-export async function planProjectAdopt(rootIn: string): Promise<ProjectPlan | null> {
+export async function planProjectAdopt(
+  rootIn: string,
+  /** The config already resolved for this root (doctor has it); used only if it is for this root. */
+  known?: ResolvedConfig,
+): Promise<ProjectPlan | null> {
   const root = resolve(rootIn);
   // In the home directory ".claude" is user scope; there is no project.
   if (isHome(root)) return null;
-  const resolved = await resolveConfig(root);
+  const resolved = known && resolve(known.cwd) === root ? known : await resolveConfig(root);
   const file = localSettingsPath(root);
   const settings = await readLocalSettings(file);
   if (settings === "invalid") return null;

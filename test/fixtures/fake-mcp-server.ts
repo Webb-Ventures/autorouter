@@ -5,6 +5,7 @@
  * exercised — Claude Code itself only fetches the first page, and the router
  * must not inherit that behaviour.
  */
+import { appendFileSync } from "node:fs";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -144,6 +145,10 @@ function bigResult(name: string, args: Record<string, unknown>): Record<string, 
       return null;
   }
 }
+
+// One line per launch, so a test can count how many times the router started
+// this server (each catalog build launches it once).
+if (process.env.FAKE_MCP_LAUNCH_LOG) appendFileSync(process.env.FAKE_MCP_LAUNCH_LOG, "launch\n");
 
 const server = new Server(
   { name: "fake-server", version: "1.0.0" },

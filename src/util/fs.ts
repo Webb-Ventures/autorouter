@@ -119,6 +119,32 @@ export async function findByName(
   return out;
 }
 
+/**
+ * `Promise.all(items.map(fn))` with at most `limit` calls in flight, results in
+ * input order.
+ *
+ * The order is the point: callers dedupe by first occurrence and rank ties by
+ * position, so running the reads concurrently must not reorder what they
+ * return. The bound is there because an unbounded fan-out over a large skill
+ * library opens every file at once, and macOS's default descriptor limit is 256.
+ */
+export async function mapLimit<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]!, i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), items.length) }, worker));
+  return out;
+}
+
 /** Non-recursive listing of files matching an extension. */
 export async function listFiles(root: string, ext: string): Promise<string[]> {
   let entries;

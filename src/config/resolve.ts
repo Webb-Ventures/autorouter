@@ -115,16 +115,20 @@ export async function resolveConfig(cwd = process.cwd()): Promise<ResolvedConfig
     plugins: () => loadPluginServers(),
     cmux: () => loadCmux(),
   };
+  // The importers read unrelated files, so they run concurrently. Their results
+  // are appended in `import` order all the same: that order decides which
+  // registration wins a dedupe and which name gets a "-2" suffix.
+  const loads: Promise<ServerEntry[]>[] = [];
   for (const name of config.import) {
-    const load = loaders[name];
+    // Own keys only: "constructor" in `import` would otherwise reach a
+    // prototype method, which the old in-loop try/catch happened to absorb.
+    const load = Object.prototype.hasOwnProperty.call(loaders, name) ? loaders[name] : undefined;
     if (!load) continue;
     sources.push(...harnessSources(name, cwd));
-    try {
-      imported.push(...(await load()));
-    } catch {
-      // A broken harness config must not take the router down.
-    }
+    // A broken harness config must not take the router down.
+    loads.push(load().catch(() => []));
   }
+  for (const entries of await Promise.all(loads)) imported.push(...entries);
 
   for (const [name, raw] of Object.entries(config.servers)) {
     const entry = normalizeServer(name, raw as any, "config");

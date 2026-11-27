@@ -53,7 +53,11 @@ export function instructionsFor(activation: RouterConfig["activation"]): string 
 }
 
 export async function serve(opts: { cwd?: string } = {}): Promise<void> {
-  const router = await Router.create({ cwd: opts.cwd });
+  // Embeddings warm in the background: until they are ready a search is
+  // lexical, which is what it is anyway when no embedding provider is set.
+  // Connecting first is not an option — the tool descriptions in the first
+  // tools/list are built from the catalog, so it has to exist by then.
+  const router = await Router.create({ cwd: opts.cwd, warmInBackground: true });
   const server = new Server(
     { name: NAME, version: VERSION },
     {
@@ -175,7 +179,9 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
 
   server.setRequestHandler(GetPromptRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
-    if (await router.isStale()) await router.refresh();
+    // refresh() checks staleness itself; checking first as well stat'd every
+    // source twice per request.
+    await router.refresh();
     return await handleGetPrompt(router, name, args as Record<string, string>, promptMode);
   });
 
@@ -190,8 +196,10 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
           // we already know is stale. Going through refreshAndAnnounce rather
           // than refresh() is what lets a server added since startup be adopted
           // and found in the same request — a host that never re-lists its tools
-          // would otherwise never trigger the check at all.
-          if (await router.isStale()) await refreshAndAnnounce();
+          // would otherwise never trigger the check at all. No separate isStale()
+          // first: refresh() makes that check itself, and waits out a rebuild
+          // already in flight.
+          await refreshAndAnnounce();
           return await handleFind(router, server, profile, activated, activation, args as any, drainNotes(), {
             results,
             promoteOnUse,
@@ -263,8 +271,9 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
 
   async function refreshAndAnnounce(): Promise<void> {
     const before = router.summary();
-    const wasStale = await router.isStale();
-    await router.refresh();
+    // refresh() reports whether it found the catalog stale, so the verdict
+    // auto-adopt hangs on costs no second pass over the sources.
+    const wasStale = await router.refresh();
     if (wasStale) await maybeAutoAdopt();
 
     if (router.summary() === before) return;

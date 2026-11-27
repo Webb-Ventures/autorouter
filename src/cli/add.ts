@@ -4,6 +4,7 @@ import { normalizeServer, isSelfReference, type RawServer } from "../config/adap
 import { connect, enumerateServer } from "../catalog/providers/mcp.ts";
 import { authHint } from "../config/oauth.ts";
 import { Router } from "../router.ts";
+import type { Capability } from "../catalog/types.ts";
 
 export type AddSpec = {
   name?: string;
@@ -136,11 +137,11 @@ export async function runAdd(
   );
 
   let client;
-  let capabilities: number | undefined;
+  let enumerated: Capability[] = [];
   let failure: string | undefined;
   try {
     client = await connect(entry);
-    capabilities = (await enumerateServer(entry, client)).length;
+    enumerated = await enumerateServer(entry, client);
   } catch (err) {
     failure = authHint(name, err, entry.transport === "http" ? entry.oauth : undefined);
   } finally {
@@ -162,9 +163,12 @@ export async function runAdd(
   // Rebuild now rather than waiting out the TTL, so the very next search sees
   // it. A running serve process picks the same change up from the config file's
   // fingerprint.
+  // What was just enumerated stands in for connecting to it a second time;
+  // buildCatalog only uses it if the resolved entry is this exact server.
   opts.onProgress?.("Rebuilding the catalog…");
-  const router = await Router.create({ cwd, force: true });
+  const router = await Router.create({ cwd, force: true, reuse: { entry, capabilities: enumerated } });
   await router.close();
+  const capabilities = enumerated.length;
 
   return {
     ok: true,

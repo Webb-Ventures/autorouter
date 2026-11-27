@@ -585,6 +585,9 @@ async function cmdAdopt(flags: Flags): Promise<number> {
   // plan itself can exclude them.
   const unreachable = await unreachableServers();
   const unreachableNames = new Set(unreachable.keys());
+  // Resolved once for the preview and the apply below: the apply re-reads the
+  // files it rewrites, so this only spares re-reading every harness config.
+  const resolved = await resolveConfig(process.cwd());
 
   const preview = await runAdopt({
     harness,
@@ -592,6 +595,7 @@ async function cmdAdopt(flags: Flags): Promise<number> {
     keep,
     dryRun: true,
     unreachable: unreachableNames,
+    resolved,
     ...extrasOpts,
   });
   const total = preview.plans.reduce((n, p) => n + p.moved.length, 0);
@@ -667,6 +671,7 @@ async function cmdAdopt(flags: Flags): Promise<number> {
     keep,
     dryRun: false,
     unreachable: unreachableNames,
+    resolved,
     ...extrasOpts,
   });
   console.log("");

@@ -250,7 +250,7 @@ export async function runLogin(opts: {
     };
   }
   if (mode.announce) console.log(mode.announce);
-  return await authorize(entry, port, want, mode.kind);
+  return await authorize(entry, port, want, mode.kind, mode.info);
   }
 }
 
@@ -269,7 +269,7 @@ async function resolveMode(
   opts: { device?: boolean; manual?: boolean },
 ): Promise<
   | { kind: "device"; info?: OAuthServerInfo; advertised: string[]; announce?: string }
-  | { kind: "browser" | "manual"; announce?: string }
+  | { kind: "browser" | "manual"; announce?: string; info?: OAuthServerInfo }
 > {
   if (opts.manual) return { kind: "manual" };
 
@@ -296,6 +296,8 @@ async function resolveMode(
   }
   return {
     kind: "manual",
+    // Already discovered to rule out the device flow; authorize() reuses it.
+    info,
     announce:
       `No display detected, and ${entry.name} does not offer the device flow — falling back to\n` +
       `  the paste-the-code flow. Open the URL below on any machine with a browser.`,
@@ -371,6 +373,8 @@ async function authorize(
   port: number,
   want: ScopeRequest,
   mode: "browser" | "manual" = "browser",
+  /** Discovery resolveMode already performed, when it did. */
+  known?: OAuthServerInfo,
 ): Promise<LoginResult> {
   // Captured after auth() generates it, and compared against what the browser
   // sends back.
@@ -426,8 +430,10 @@ async function authorize(
   // before a browser window opens.
   let advertised: string[] = [];
   let canRegister = true;
+  let discovered: OAuthServerInfo | undefined;
   try {
-    const info = await discoverServerInfo(entry.url, entry.oauth);
+    const info = known ?? (await discoverServerInfo(entry.url, entry.oauth));
+    discovered = info;
     advertised = advertisedFrom(info, entry.oauth);
     canRegister = Boolean(info.authorizationServerMetadata?.registration_endpoint);
   } catch (err) {
@@ -487,6 +493,10 @@ async function authorize(
     openBrowser(url.toString());
   };
   const provider = new FileTokenStore(entry.name, port, onRedirect, entry.oauth);
+  // Hand auth() the discovery done above. Otherwise it runs the whole chain a
+  // second time (or refetches the configured metadata URL) before the browser
+  // opens; this is the same state it would have saved for itself.
+  if (discovered) await provider.saveDiscoveryState(discovered);
 
   try {
     const first = await auth(provider, { serverUrl: entry.url, scope, fetchFn: serializeRefresh(entry.name, fetch) });

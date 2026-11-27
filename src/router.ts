@@ -1,6 +1,6 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { resolveConfig, type ResolvedConfig } from "./config/resolve.ts";
-import { buildCatalog, getCatalog, isStale, saveCatalog } from "./catalog/build.ts";
+import { buildCatalog, getCatalog, isStale, saveCatalog, type BuildOptions } from "./catalog/build.ts";
 import type { Capability, Catalog, CapabilityKind } from "./catalog/types.ts";
 import { HybridIndex, type Scored } from "./index/search.ts";
 import { selectCapabilities } from "./selector/index.ts";
@@ -64,8 +64,12 @@ export class Router {
    */
   resolved: ResolvedConfig;
   guard: Guard;
-  /** In-flight refresh, so concurrent searches share one rebuild. */
-  private refreshing: Promise<void> | null = null;
+  /**
+   * In-flight refresh, so concurrent searches share one rebuild. Resolves to
+   * whether the catalog was found stale (and a rebuild ran), which is the
+   * verdict callers need without paying for a second staleness check.
+   */
+  private refreshing: Promise<boolean> | null = null;
 
   private constructor(
     resolved: ResolvedConfig,
@@ -80,18 +84,83 @@ export class Router {
     this.index = index;
   }
 
-  static async create(opts: { cwd?: string; force?: boolean } = {}): Promise<Router> {
+  static async create(
+    opts: {
+      cwd?: string;
+      force?: boolean;
+      reuse?: BuildOptions["reuse"];
+      /**
+       * Let embeddings warm up after create() returns. Only for `serve`: a
+       * search meanwhile is lexical (HybridIndex.search without vectors), and
+       * the host's first requests are not held behind embedding the catalog.
+       * A one-shot command would exit before the vectors arrived, so it waits.
+       */
+      warmInBackground?: boolean;
+    } = {},
+  ): Promise<Router> {
     const resolved = await resolveConfig(opts.cwd);
-    const catalog = await getCatalog(resolved, { force: opts.force });
+    const { catalog, rebuilding } = await getCatalog(resolved, { force: opts.force, reuse: opts.reuse });
     const index = new HybridIndex(catalog.capabilities, resolved.config);
-    await index.warmEmbeddings();
-    return new Router(
+    if (opts.warmInBackground) void index.warmEmbeddings();
+    else await index.warmEmbeddings();
+    const router = new Router(
       resolved,
       catalog,
       index,
       new ConnectionPool(resolved.servers),
       new Guard(resolved.config),
     );
+    if (rebuilding) router.adopt(resolved, rebuilding);
+    return router;
+  }
+
+  /**
+   * Takes over the background rebuild getCatalog started for a stale cached
+   * catalog, as this router's in-flight refresh.
+   *
+   * Holding it in the refresh slot is what makes it the only build: a search
+   * that finds the catalog stale shares it instead of starting another, and a
+   * forced refresh waits it out before building again, as it would any other.
+   * A one-shot command never waits on it, so it still exits promptly.
+   */
+  private adopt(resolved: ResolvedConfig, rebuilding: Promise<Catalog>): void {
+    let run!: Promise<boolean>;
+    run = (async () => {
+      try {
+        const catalog = await rebuilding;
+        // retarget() does not wait for this build (see there); once the router
+        // has moved to another workspace, this one's catalog must not land.
+        if (resolvePath(this.resolved.cwd) === resolvePath(resolved.cwd)) await this.install(resolved, catalog);
+      } catch {
+        // Same as a failed refresh: keep serving the catalog we have.
+      } finally {
+        if (this.refreshing === run) this.refreshing = null;
+        if (this.adopted === run) this.adopted = null;
+      }
+      return true;
+    })();
+    this.refreshing = run;
+    this.adopted = run;
+  }
+
+  /** The refresh slot's occupant when it is an adopted background build. */
+  private adopted: Promise<boolean> | null = null;
+
+  /** Swaps in a built catalog, once its index is ready. */
+  private async install(resolved: ResolvedConfig, catalog: Catalog): Promise<void> {
+    const index = new HybridIndex(catalog.capabilities, resolved.config);
+    await index.warmEmbeddings();
+    // Swap only after the new index is fully built, so no search ever sees
+    // a half-populated one.
+    this.resolved = resolved;
+    this.guard = new Guard(resolved.config);
+    this.catalog = catalog;
+    this.index = index;
+    // Servers that failed at the previous build may now be reachable, and
+    // a pooled connection created against the old grant would keep failing.
+    // The entry list is replaced too, or a server added since startup is
+    // indexed and then fails to dispatch.
+    this.pool.setEntries(resolved.servers);
   }
 
   /**
@@ -106,8 +175,13 @@ export class Router {
    *
    * The rebuild runs in the background and the caller is not blocked; a search
    * issued during it still answers from the current index.
+   *
+   * Resolves true when the catalog was stale (or the refresh was forced) and a
+   * rebuild ran, even one that failed. Callers used to get that verdict from a
+   * separate isStale() call first, which stat'd every source file and parsed
+   * every grant a second time.
    */
-  async refresh(opts: { force?: boolean } = {}): Promise<void> {
+  async refresh(opts: { force?: boolean } = {}): Promise<boolean> {
     if (this.refreshing) {
       const inFlight = this.refreshing;
       if (!opts.force) return inFlight;
@@ -121,35 +195,26 @@ export class Router {
     // The slot is claimed before the first await. Checking staleness first left
     // a window in which two back-to-back requests both saw no refresh running
     // and each started a full rebuild.
-    let run!: Promise<void>;
+    let run!: Promise<boolean>;
     run = (async () => {
+      let stale = Boolean(opts.force);
       try {
-        if (!opts.force && !(await isStale(this.catalog, this.resolved.config.cacheTtlSec))) return;
+        if (!stale) stale = await isStale(this.catalog, this.resolved.config.cacheTtlSec);
+        if (!stale) return false;
         // Re-read the config, not just the catalog. The server list is an input
         // to the build, and the thing that most often changed since the last one
         // is precisely that list.
         const resolved = await resolveConfig(this.resolved.cwd);
         const catalog = await buildCatalog(resolved);
         await saveCatalog(catalog);
-        const index = new HybridIndex(catalog.capabilities, resolved.config);
-        await index.warmEmbeddings();
-        // Swap only after the new index is fully built, so no search ever sees
-        // a half-populated one.
-        this.resolved = resolved;
-        this.guard = new Guard(resolved.config);
-        this.catalog = catalog;
-        this.index = index;
-        // Servers that failed at the previous build may now be reachable, and
-        // a pooled connection created against the old grant would keep failing.
-        // The entry list is replaced too, or a server added since startup is
-        // indexed and then fails to dispatch.
-        this.pool.setEntries(resolved.servers);
+        await this.install(resolved, catalog);
       } catch {
         // Keep serving what we have. A transient network failure during a
         // background rebuild must not take the router down.
       } finally {
         if (this.refreshing === run) this.refreshing = null;
       }
+      return stale;
     })();
     this.refreshing = run;
     return run;
@@ -166,27 +231,29 @@ export class Router {
    */
   async retarget(cwd: string): Promise<boolean> {
     if (resolvePath(cwd) === resolvePath(this.resolved.cwd)) return false;
-    while (this.refreshing) await this.refreshing;
+    // An adopted background build is not waited for. It rebuilds the
+    // directory being left, which used to happen unobserved: holding the move
+    // to the host's real workspace behind it (every server connected first)
+    // would be a new delay. It checks the workspace before installing instead.
+    while (this.refreshing && this.refreshing !== this.adopted) await this.refreshing;
     if (resolvePath(cwd) === resolvePath(this.resolved.cwd)) return false;
 
     const work = (async () => {
       const resolved = await resolveConfig(resolvePath(cwd));
-      const catalog = await getCatalog(resolved);
-      const index = new HybridIndex(catalog.capabilities, resolved.config);
-      await index.warmEmbeddings();
-      this.resolved = resolved;
-      this.guard = new Guard(resolved.config);
-      this.catalog = catalog;
-      this.index = index;
-      this.pool.setEntries(resolved.servers);
+      const { catalog, rebuilding } = await getCatalog(resolved);
+      await this.install(resolved, catalog);
+      // A stale cached catalog for the new root is being rebuilt. It takes
+      // over the slot as the next refresh, as in create(), so the first search
+      // there shares it rather than building a second time.
+      if (rebuilding) this.adopt(resolved, rebuilding);
     })();
     // Retargeting holds the refresh slot. Otherwise a refresh that starts while
     // this is awaiting builds for the old directory and, finishing later,
     // overwrites the new workspace's state with it.
-    const slot: Promise<void> = work
+    const slot: Promise<boolean> = work
       .then(
-        () => {},
-        () => {},
+        () => false,
+        () => false,
       )
       .finally(() => {
         if (this.refreshing === slot) this.refreshing = null;

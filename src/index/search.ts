@@ -1,7 +1,7 @@
 import type { Capability, CapabilityKind } from "../catalog/types.ts";
 import type { RouterConfig } from "../config/types.ts";
 import { Bm25Index } from "./bm25.ts";
-import { createProvider, embedCatalog, cosine, type Vector } from "./embeddings.ts";
+import { createProvider, embedCatalog, cosine, QUERY_EMBED_TIMEOUT_MS, type Vector } from "./embeddings.ts";
 
 export type Scored = { capability: Capability; score: number; lexical: number; semantic: number };
 
@@ -46,7 +46,9 @@ export class HybridIndex {
       if (this.vectors) {
         this.embedQuery = async (q) => {
           try {
-            return (await provider.embed([q]))[0] ?? null;
+            // Bounded: a stalled endpoint must not hold the search; null
+            // drops it to lexical scoring.
+            return (await provider.embed([q], { timeoutMs: QUERY_EMBED_TIMEOUT_MS }))[0] ?? null;
           } catch {
             return null;
           }

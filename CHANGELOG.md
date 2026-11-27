@@ -199,6 +199,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and removes one an older version wrote. Claude Code already injects the
   server's instructions into every request, so the primer said everything
   twice. Other harnesses keep a shorter primer.
+- Claude Code's routine rewrites of `~/.claude.json` no longer trigger a
+  rebuild. Every few minutes the next search waited while the router
+  reconnected to every server; now only a change to what the catalog reads from
+  that file (its servers, this project's entry, trust and `.mcp.json`
+  approvals) counts, and the same goes for `~/.claude/settings.json`. Existing
+  catalogs rebuild once to pick up the new fingerprint.
+- A stale cached catalog is rebuilt once at startup, not twice. `serve` used to
+  discard the background rebuild and run another on the first search.
+- Searches, slash-command lookups and `tools/list` check for changes once per
+  request instead of two or three times.
+- Catalog builds read skills, plugin commands and agents, and harness configs
+  concurrently, and connect to servers while the files are still being read.
+  The resulting catalog is unchanged, ordering included.
+- With embeddings configured, `serve` answers before the catalog is embedded
+  (searches are lexical until it is), embedding requests time out (a stalled
+  query falls back to lexical search instead of hanging), batches run a few at
+  a time, and the vector cache drops superseded and long-unused entries.
+- `doctor` runs its read-only checks alongside the catalog build, `adopt`
+  resolves the config once, `add` no longer starts the new server a second time
+  to rebuild the catalog, and `login` reuses discovery it already performed.
+- Large results are serialised once rather than several times, and paging
+  through a saved file no longer rereads the whole file for every page.
+- Per-directory catalog files untouched for 30 days are deleted from the cache,
+  including those orphaned by the cache-file rename.
 
 ### Fixed
 

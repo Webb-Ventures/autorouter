@@ -129,14 +129,17 @@ export class ResultStore {
     const texts = content.filter((c): c is { type: "text"; text: string } => c.type === "text");
     const others = content.filter((c) => c.type !== "text");
     const joined = texts.map((t) => t.text).join("\n\n");
-    const size = Math.max(tokensOf(joined), structuredContent ? tokensOf(structuredContent) : 0);
+    // Each size is measured once. structuredContent can be the whole payload a
+    // second time, and stringifying it is the expensive part of this check.
+    const joinedTokens = tokensOf(joined);
+    const size = Math.max(joinedTokens, structuredContent ? tokensOf(structuredContent) : 0);
     if (size <= limit) return { content, spilled: false, structuredContent };
 
     const unwrapped = unwrapUntrusted(joined);
     let shape = classify(unwrapped.body);
     // Text that is not JSON, next to structured data that is: the structured
     // copy is the one worth querying.
-    if (shape.kind === "text" && structuredContent !== undefined && tokensOf(joined) < limit) {
+    if (shape.kind === "text" && structuredContent !== undefined && joinedTokens < limit) {
       shape = classifyValue(structuredContent);
     }
     const serialized = serialize(shape);
@@ -152,6 +155,7 @@ export class ResultStore {
       }
     }
     this.remember({ handle, source, text: serialized, path });
+    if (path) await this.holdPageText(handle, path, serialized);
 
     const card = path
       ? renderFileCard({ shape, path, handle, tokens: size, warning: unwrapped.warning, serialized })
@@ -173,8 +177,10 @@ export class ResultStore {
     this.saved.set(handle, entry);
     const offset = Math.max(0, Math.floor(Number(args.offset ?? 0)) || 0);
     const limit = Math.max(500, Math.floor(Number(args.limit ?? 0)) || this.config.spillOverTokens * 4);
-    // A file-backed entry is reread per page rather than held in memory.
-    const text = entry.path ? await readFile(entry.path, "utf8").catch(() => null) : entry.text;
+    // A file-backed entry is reread from disk rather than held in memory —
+    // except the one most recently written or paged, so walking one result
+    // page by page does not reread the whole file for every page.
+    const text = entry.path ? await this.fileText(handle, entry.path) : entry.text;
     if (text === null) {
       return {
         content: [{ type: "text", text: `Saved result "${handle}" is no longer on disk; call the tool again.` }],
@@ -223,18 +229,54 @@ export class ResultStore {
     return path;
   }
 
+  /**
+   * The text of one file-backed result, kept so consecutive pages of it are
+   * served without rereading the file. One slot only, and it counts against
+   * PAGE_STORE_MAX_CHARS alongside the paged entries (and is the first thing
+   * dropped to make room for them), so it cannot grow the store past its
+   * bound. The stat is what keeps it honest: a file that was deleted or
+   * rewritten since is read (or reported missing) exactly as before.
+   */
+  private pageText: { handle: string; text: string; mtimeMs: number; size: number } | null = null;
+
+  private async holdPageText(handle: string, path: string, text: string): Promise<void> {
+    this.pageText = null;
+    if (this.savedChars + text.length > PAGE_STORE_MAX_CHARS) return;
+    try {
+      const st = await stat(path);
+      this.pageText = { handle, text, mtimeMs: st.mtimeMs, size: st.size };
+    } catch {
+      // Not cached; page() reads (or reports) the file itself.
+    }
+  }
+
+  private async fileText(handle: string, path: string): Promise<string | null> {
+    const held = this.pageText;
+    if (held?.handle === handle) {
+      const st = await stat(path).catch(() => null);
+      if (!st) return null;
+      if (st.mtimeMs === held.mtimeMs && st.size === held.size) return held.text;
+    }
+    const text = await readFile(path, "utf8").catch(() => null);
+    if (text !== null) await this.holdPageText(handle, path, text);
+    return text;
+  }
+
   private remember(entry: Saved): void {
     this.saved.set(entry.handle, entry);
     // Only paged entries hold their text in memory; a file-backed one is
     // reread from disk on demand, so it costs the store nothing to keep.
     this.savedChars += entry.path ? 0 : entry.text.length;
     if (entry.path) entry.text = "";
+    // The held page text gives way before any paged entry is evicted.
+    if (this.pageText && this.savedChars + this.pageText.text.length > PAGE_STORE_MAX_CHARS) this.pageText = null;
     while (this.saved.size > PAGE_STORE_MAX_ENTRIES || this.savedChars > PAGE_STORE_MAX_CHARS) {
       const oldest = this.saved.keys().next().value;
       if (oldest === undefined || oldest === entry.handle) break;
       const gone = this.saved.get(oldest)!;
       this.savedChars -= gone.text.length;
       this.saved.delete(oldest);
+      if (this.pageText?.handle === oldest) this.pageText = null;
     }
   }
 }
@@ -305,12 +347,42 @@ export function classifyValue(value: unknown): Shape {
     if (arrays.length === 1) {
       const [key, rows] = arrays[0]!;
       const rest = Object.fromEntries(Object.entries(value).filter(([k]) => k !== key));
-      if (tokensOf(rows) >= 0.8 * tokensOf(value)) {
+      if (Math.ceil(rowsChars(rows as Record<string, unknown>[]) / 4) >= 0.8 * Math.ceil(envelopeChars(key, rows as Record<string, unknown>[], rest) / 4)) {
         return { kind: "rows", rows: rows as Record<string, unknown>[], rowsPath: `.${key}`, wrapper: rest };
       }
     }
   }
   return { kind: "json", value };
+}
+
+/**
+ * Each row's JSON, computed once per rows array: the envelope check measures
+ * it, and serialize() writes the same strings out as JSONL. Before, the rows
+ * were stringified for the check, the whole envelope again for its total, and
+ * the rows a third time to write them.
+ */
+const rowJson = new WeakMap<Record<string, unknown>[], string[]>();
+
+function rowLines(rows: Record<string, unknown>[]): string[] {
+  let lines = rowJson.get(rows);
+  if (!lines) rowJson.set(rows, (lines = rows.map((r) => JSON.stringify(r))));
+  return lines;
+}
+
+/** JSON.stringify(rows).length, from the per-row strings. */
+function rowsChars(rows: Record<string, unknown>[]): number {
+  return rowLines(rows).reduce((n, l) => n + l.length, 0) + rows.length - 1 + 2;
+}
+
+/**
+ * JSON.stringify(envelope).length without stringifying the rows again: the
+ * envelope is `rest` plus one `"key":[rows]` member, and the row array is
+ * never one of the values JSON.stringify drops.
+ */
+function envelopeChars(key: string, rows: Record<string, unknown>[], rest: Record<string, unknown>): number {
+  const restChars = JSON.stringify(rest).length;
+  const member = JSON.stringify(key).length + 1 + rowsChars(rows);
+  return restChars === 2 ? 2 + member : restChars + 1 + member;
 }
 
 function isRowArray(v: unknown): v is Record<string, unknown>[] {
@@ -328,7 +400,7 @@ function looksLikeMarkdown(t: string): boolean {
 function serialize(shape: Shape): string {
   switch (shape.kind) {
     case "rows":
-      return `${shape.rows.map((r) => JSON.stringify(r)).join("\n")}\n`;
+      return `${rowLines(shape.rows).join("\n")}\n`;
     case "json":
       return `${JSON.stringify(shape.value, null, 2)}\n`;
     case "text":
@@ -374,7 +446,9 @@ function renderFileCard(o: {
   serialized: string;
 }): string {
   const lines: string[] = [`~${fmt(o.tokens)} tokens — saved to a file instead of inlined.`];
-  const lineCount = o.serialized.split("\n").length - 1;
+  // Counted rather than split: splitting copied the whole payload into an array.
+  let lineCount = 0;
+  for (let i = o.serialized.indexOf("\n"); i !== -1; i = o.serialized.indexOf("\n", i + 1)) lineCount++;
   if (o.shape.kind === "rows") {
     lines.push(`file:   ${o.path}  (${fmt(o.shape.rows.length)} rows, one JSON object per line${o.shape.rowsPath ? `, from ${o.shape.rowsPath}` : ""})`);
     if (o.shape.wrapper && Object.keys(o.shape.wrapper).length) {

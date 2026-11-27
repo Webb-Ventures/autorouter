@@ -2,7 +2,7 @@ import { join, resolve } from "node:path";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { ensureDir, readText, writeText } from "../util/fs.ts";
 import { homeDir, stripJsonComments } from "../util/paths.ts";
-import { resolveConfig } from "../config/resolve.ts";
+import { resolveConfig, type ResolvedConfig } from "../config/resolve.ts";
 import { upsertProjectServers, upsertServers } from "../config/write.ts";
 import type { Harness } from "./init.ts";
 import { isSelfReference, normalizeServer } from "../config/adapters/shared.ts";
@@ -55,8 +55,16 @@ export async function runAdopt(opts: {
   skillMode?: SkillMode;
   keepSkills?: string[];
   keepPlugins?: string[];
+  /**
+   * The config already resolved for `cwd`, when the caller has it. Doctor and
+   * auto-adopt run one pass per harness and `adopt` a preview then the real
+   * thing; resolving again for each re-read every harness config to learn
+   * nothing new. Only read-only inputs come from it (alwaysExpose, the server
+   * list, the config path); the files adopt rewrites are always read fresh.
+   */
+  resolved?: ResolvedConfig;
 }): Promise<AdoptResult> {
-  const resolved = await resolveConfig(opts.cwd);
+  const resolved = opts.resolved ?? (await resolveConfig(opts.cwd));
   // alwaysExpose capabilities must stay first-class, so their servers stay put.
   const keep = new Set([
     "autorouter",
@@ -255,7 +263,7 @@ export async function runAutoAdopt(cwd: string): Promise<string[]> {
   for (const harness of HARNESSES) {
     if (!resolved.config.import.includes(harness)) continue;
     try {
-      const result = await runAdopt({ harness, cwd, keep: [], dryRun: false, extras: false });
+      const result = await runAdopt({ harness, cwd, keep: [], dryRun: false, extras: false, resolved });
       const moved = result.plans.flatMap((p) => p.moved);
       if (moved.length) notes.push(`adopted ${moved.join(", ")} from ${harness}`);
     } catch {
