@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `adopt` no longer disables plugins that contribute things the router cannot
+  stand in for. It read only `.claude-plugin/plugin.json`, so the official
+  `*-lsp` plugins (no plugin.json; their marketplace entry declares
+  `lspServers`) and plugins whose MCP server sits in the default `.mcp.json`
+  were labelled "skills only" and turned off, taking their LSP servers, hooks,
+  agents and commands with them. Plugins are now read as Claude Code reads
+  them (default layout, plugin.json and the marketplace.json entry). Any
+  plugin with LSP servers, hooks, commands, agents, output styles, workflows,
+  themes, monitors, `bin/` executables, MCP bundles or skills outside
+  `skills/` stays enabled with a skip note. Plugins already disabled by an
+  earlier adopt are flagged with the `enabledPlugins` key to set back to
+  `true`. "skills only" now requires the router to index at least one of the
+  plugin's skills.
 - `login --read-only` no longer grants Gmail's full-access scopes. Google's
   scopes are URLs with no word like "write" in them, so 15 of the Gmail MCP
   server's 20 were classed as read — `https://mail.google.com/` (the whole
