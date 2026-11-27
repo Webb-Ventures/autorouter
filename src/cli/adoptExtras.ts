@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { exists, readText, writeText } from "../util/fs.ts";
-import { homeDir, stripJsonComments } from "../util/paths.ts";
+import { claudeInstall, claudeSettingsPath, stripJsonComments, type ClaudeInstall } from "../util/paths.ts";
 import { listInstalledPlugins, readPluginServers } from "../config/adapters/plugins.ts";
 import { collectSkills } from "../catalog/providers/skills.ts";
 
@@ -46,8 +46,9 @@ type Settings = {
   enabledPlugins?: Record<string, unknown>;
 };
 
-export function settingsPath(): string {
-  return join(homeDir(), ".claude", "settings.json");
+/** The settings.json adopt edits: the given install's, else the active one's. */
+export function settingsPath(install: ClaudeInstall = claudeInstall()): string {
+  return claudeSettingsPath(install);
 }
 
 /**
@@ -65,15 +66,18 @@ export async function planExtras(opts: {
   routedServers: Set<string>;
   /** Servers the router could not connect to; their plugins must stay enabled. */
   unreachable?: Set<string>;
+  /** The Claude Code install to plan for (default: the active one). */
+  install?: ClaudeInstall;
 }): Promise<ExtrasPlan> {
-  const file = settingsPath();
+  const install = opts.install ?? claudeInstall();
+  const file = settingsPath(install);
   const settings = (await readSettings(file)) ?? {};
   const plan: ExtrasPlan = { file, skills: [], plugins: [], skipped: [] };
 
   const keepSkills = new Set(opts.keepSkills);
   const keepPlugins = new Set(opts.keepPlugins);
 
-  const plugins = await listInstalledPlugins();
+  const plugins = await listInstalledPlugins(install);
   const pluginByName = new Map(plugins.map((p) => [p.name, p]));
 
   // Disable whole plugins first: a disabled plugin takes its own skills with
@@ -138,7 +142,7 @@ export async function planExtras(opts: {
   // user settings: a project skill hidden here would hide every same-named
   // skill in every repo. Project skills are hidden per repo instead
   // (workspace/project.ts).
-  const { capabilities } = await collectSkills(opts.skillPaths, opts.cwd, { includePlugins: true });
+  const { capabilities } = await collectSkills(opts.skillPaths, opts.cwd, { includePlugins: true, install });
   for (const cap of capabilities) {
     if (cap.origin === "project") continue;
     if (cap.server && (disabledPluginNames.has(cap.server) || untouched.has(cap.server))) continue;
@@ -199,11 +203,11 @@ async function readSettings(file: string): Promise<Settings | null> {
 }
 
 /** Every installed plugin with the MCP servers it contributes. */
-export async function pluginsWithServers(): Promise<
+export async function pluginsWithServers(install: ClaudeInstall = claudeInstall()): Promise<
   { key: string; name: string; servers: string[] }[]
 > {
   const out: { key: string; name: string; servers: string[] }[] = [];
-  for (const plugin of await listInstalledPlugins()) {
+  for (const plugin of await listInstalledPlugins(install)) {
     out.push({ key: plugin.key, name: plugin.name, servers: await pluginServerNames(plugin.root) });
   }
   return out;

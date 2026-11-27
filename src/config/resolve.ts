@@ -1,10 +1,10 @@
 import { join, resolve } from "node:path";
 import { DEFAULT_CONFIG, type RouterConfig, type ServerEntry } from "./types.ts";
-import { homeDir, absPath, readJson } from "../util/paths.ts";
+import { homeDir, absPath, readJson, claudeInstall, claudeSettingsPath, type ClaudeInstall } from "../util/paths.ts";
 import { loadClaude } from "./adapters/claude.ts";
 import { loadCursor, loadVscode } from "./adapters/cursor.ts";
 import { loadCodex } from "./adapters/codex.ts";
-import { loadPluginServers } from "./adapters/plugins.ts";
+import { installedPluginsPath, loadPluginServers } from "./adapters/plugins.ts";
 import { cmuxSocketPath, loadCmux } from "./adapters/cmux.ts";
 import { isSelfReference, normalizeServer, specKey } from "./adapters/shared.ts";
 import { mainCheckout } from "../workspace/trust.ts";
@@ -14,6 +14,8 @@ export type ResolvedConfig = {
   servers: ServerEntry[];
   configPath: string | null;
   cwd: string;
+  /** The Claude Code install whose servers, plugins and skills this reflects. */
+  install: ClaudeInstall;
   /**
    * Every file whose contents could change the server list, existing or not.
    *
@@ -29,16 +31,16 @@ export type ResolvedConfig = {
 };
 
 /** Config files each importer reads, for change detection. */
-function harnessSources(name: string, cwd: string): string[] {
+function harnessSources(name: string, cwd: string, install: ClaudeInstall): string[] {
   const home = homeDir();
   switch (name) {
     case "claude":
       // The settings files carry .mcp.json approvals, so they gate which
       // project servers are indexed and have to invalidate the catalog too.
       return [
-        join(home, ".claude.json"),
+        install.claudeJson,
         join(cwd, ".mcp.json"),
-        join(home, ".claude", "settings.json"),
+        claudeSettingsPath(install),
         join(cwd, ".claude", "settings.json"),
         join(cwd, ".claude", "settings.local.json"),
         join(home, ".autorouter", "approvals.json"),
@@ -50,7 +52,7 @@ function harnessSources(name: string, cwd: string): string[] {
     case "codex":
       return [join(home, ".codex", "config.toml"), join(cwd, ".codex", "config.toml")];
     case "plugins":
-      return [join(home, ".claude", "plugins", "installed_plugins.json")];
+      return [installedPluginsPath(install)];
     case "cmux":
       // Present only while cmux runs, so starting or quitting it re-indexes.
       return [cmuxSocketPath()];
@@ -76,7 +78,16 @@ function pruneUndefined<T extends object>(o: T | null | undefined): Partial<T> {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as Partial<T>;
 }
 
-export async function resolveConfig(cwd = process.cwd()): Promise<ResolvedConfig> {
+/**
+ * `install` picks the Claude Code install whose servers and plugins are read —
+ * the active one ($CLAUDE_CONFIG_DIR, else ~/.claude) unless a caller adopting
+ * several installs names another.
+ */
+export async function resolveConfig(
+  cwd = process.cwd(),
+  opts: { install?: ClaudeInstall } = {},
+): Promise<ResolvedConfig> {
+  const install = opts.install ?? claudeInstall();
   let user: Partial<RouterConfig> | null = null;
   let configPath: string | null = null;
   for (const candidate of configCandidates(cwd)) {
@@ -108,11 +119,11 @@ export async function resolveConfig(cwd = process.cwd()): Promise<ResolvedConfig
   const imported: ServerEntry[] = [];
   const sources: string[] = [];
   const loaders: Record<string, () => Promise<ServerEntry[]>> = {
-    claude: () => loadClaude(cwd),
+    claude: () => loadClaude(cwd, install),
     cursor: () => loadCursor(cwd),
     vscode: () => loadVscode(cwd),
     codex: () => loadCodex(cwd),
-    plugins: () => loadPluginServers(),
+    plugins: () => loadPluginServers(install),
     cmux: () => loadCmux(),
   };
   // The importers read unrelated files, so they run concurrently. Their results
@@ -124,7 +135,7 @@ export async function resolveConfig(cwd = process.cwd()): Promise<ResolvedConfig
     // prototype method, which the old in-loop try/catch happened to absorb.
     const load = Object.prototype.hasOwnProperty.call(loaders, name) ? loaders[name] : undefined;
     if (!load) continue;
-    sources.push(...harnessSources(name, cwd));
+    sources.push(...harnessSources(name, cwd, install));
     // A broken harness config must not take the router down.
     loads.push(load().catch(() => []));
   }
@@ -142,7 +153,7 @@ export async function resolveConfig(cwd = process.cwd()): Promise<ResolvedConfig
     if (entry) imported.push(entry);
   }
 
-  return { config, servers: dedupeServers(imported), configPath, cwd, sources };
+  return { config, servers: dedupeServers(imported), configPath, cwd, install, sources };
 }
 
 /**

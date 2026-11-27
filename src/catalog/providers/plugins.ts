@@ -3,6 +3,7 @@ import type { Capability } from "../types.ts";
 import { estimateTokens } from "../types.ts";
 import { parseFrontmatter, keywordsFrom } from "../frontmatter.ts";
 import { listInstalledPlugins, type InstalledPlugin } from "../../config/adapters/plugins.ts";
+import { claudeInstall, type ClaudeInstall } from "../../util/paths.ts";
 import { listFiles, mapLimit, readText } from "../../util/fs.ts";
 
 /**
@@ -11,7 +12,8 @@ import { listFiles, mapLimit, readText } from "../../util/fs.ts";
  * indexed the same way skills are.
  */
 export async function collectPluginAssets(
-  /** An installed-plugin list the caller already read for this build. */
+  install: ClaudeInstall = claudeInstall(),
+  /** That install's plugin list, when the caller already read it for this build. */
   installed?: InstalledPlugin[],
 ): Promise<{
   capabilities: Capability[];
@@ -23,7 +25,7 @@ export async function collectPluginAssets(
   // Listed and read concurrently, then assembled in plugin, directory and file
   // order, so the capability list comes out exactly as the sequential loop
   // produced it (search breaks score ties by position).
-  const dirs = (installed ?? (await listInstalledPlugins())).flatMap((plugin) =>
+  const dirs = (installed ?? (await listInstalledPlugins(install))).flatMap((plugin) =>
     ([
       ["commands", "command"],
       ["agents", "agent"],

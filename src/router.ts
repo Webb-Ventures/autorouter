@@ -199,7 +199,7 @@ export class Router {
     run = (async () => {
       let stale = Boolean(opts.force);
       try {
-        if (!stale) stale = await isStale(this.catalog, this.resolved.config.cacheTtlSec);
+        if (!stale) stale = await isStale(this.catalog, this.resolved.config.cacheTtlSec, this.resolved.install);
         if (!stale) return false;
         // Re-read the config, not just the catalog. The server list is an input
         // to the build, and the thing that most often changed since the last one
@@ -265,7 +265,7 @@ export class Router {
 
   /** True when the on-disk catalog has moved on from the one in memory. */
   async isStale(): Promise<boolean> {
-    return await isStale(this.catalog, this.resolved.config.cacheTtlSec);
+    return await isStale(this.catalog, this.resolved.config.cacheTtlSec, this.resolved.install);
   }
 
   /** One-line inventory used in the router tool's own description. */

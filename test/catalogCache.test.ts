@@ -133,6 +133,35 @@ describe("~/.claude.json is fingerprinted by what the catalog reads from it", ()
     }
   }, 30_000);
 
+  test("an install under CLAUDE_CONFIG_DIR is fingerprinted the same way", async () => {
+    const { dir, cleanup } = await sandbox({ import: ["claude"] });
+    try {
+      const { buildCatalog, isStale } = await import("../src/catalog/build.ts");
+      const { resolveConfig } = await import("../src/config/resolve.ts");
+      const alt = join(dir, ".claude-alt");
+      await mkdir(alt, { recursive: true });
+      process.env.CLAUDE_CONFIG_DIR = alt;
+      // This install keeps its state file inside its own dir.
+      const claudeJson = join(alt, ".claude.json");
+      const settings = join(alt, "settings.json");
+      await rewrite(claudeJson, JSON.stringify({ numStartups: 1, mcpServers: {} }));
+      await rewrite(settings, JSON.stringify({ theme: "dark" }));
+      const resolved = await resolveConfig(join(dir, "proj"));
+      const catalog = await buildCatalog(resolved);
+      expect(catalog.sources[claudeJson]).toContain("#");
+      expect(catalog.sources[settings]).toContain("#");
+
+      await rewrite(claudeJson, JSON.stringify({ numStartups: 2, mcpServers: {} }));
+      await rewrite(settings, JSON.stringify({ theme: "light" }));
+      expect(await isStale(catalog, 3600, resolved.install)).toBe(false);
+
+      await rewrite(claudeJson, JSON.stringify({ numStartups: 2, mcpServers: { db: { command: "db" } } }));
+      expect(await isStale(catalog, 3600, resolved.install)).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  }, 30_000);
+
   test("a catalog written with the old stat-only value is stale exactly once", async () => {
     const { dir, cleanup } = await sandbox({ import: ["claude"] });
     try {

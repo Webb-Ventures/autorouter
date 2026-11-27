@@ -10,13 +10,14 @@ import { runAdd, runRemove } from "./cli/add.ts";
 import { runLogin, summarizeScopes } from "./cli/login.ts";
 import { runUpdate } from "./cli/update.ts";
 import { clearAuth, hasAuth, readAuth } from "./config/oauth.ts";
-import { resolveConfig } from "./config/resolve.ts";
+import { resolveConfig, type ResolvedConfig } from "./config/resolve.ts";
 import type { ServerEntry } from "./config/types.ts";
 import { renderCapability, renderRouteResult, oneLine } from "./server/render.ts";
 import type { CapabilityKind } from "./catalog/types.ts";
 import { loadCatalog } from "./catalog/build.ts";
 import { tuneConnectionRacing } from "./util/net.ts";
-import { absPath } from "./util/paths.ts";
+import { absPath, claudeInstall, discoverClaudeInstalls, installLabel, type ClaudeInstall } from "./util/paths.ts";
+import { existsSync } from "node:fs";
 import { ask } from "./util/ask.ts";
 import { which } from "./util/proc.ts";
 import { workspaceRoot } from "./workspace/root.ts";
@@ -61,6 +62,8 @@ const USAGE = `autorouter — one search tool instead of every tool
                                        removes them from context. --dry-run to
                                        preview.
   autorouter restore --target <harness> Undo the most recent adopt
+                                       (Claude Code: per install, see
+                                       --config-dir / --all-claude-dirs)
   autorouter adopt --project [dir]     Route this repo's .mcp.json servers and
                                        skills, hiding them from Claude Code via
                                        its settings.local.json. serve does this
@@ -95,6 +98,11 @@ Options
   --servers-only adopt: move MCP servers only; leave skills and plugins loaded
   --skill-mode M adopt: name-only (default; Claude and /name can still invoke it)
                  | user-invocable-only (Claude cannot invoke it) | off
+  --config-dir D adopt/restore --target claude: act on the Claude Code install
+                 in D (repeatable or comma-separated). Default: the active one,
+                 $CLAUDE_CONFIG_DIR or ~/.claude
+  --all-claude-dirs adopt/restore --target claude: every ~/.claude* dir with a
+                 settings.json or .claude.json. Each gets its own backup.
   --port N       login: loopback callback port (default 33418; keep it stable)
   --client-id ID login: use a pre-registered OAuth client (servers without RFC 7591)
   --client-secret S  login: its secret, if it is a confidential client
@@ -123,6 +131,10 @@ working token is an OAuth grant the harness keeps privately. The router obtains
 its own grant instead of borrowing one, so \`autorouter login <server>\` is a
 one-time step before those can be adopted. Local (stdio) servers keep their own
 credentials; \`login\` runs their sign-in command in your terminal instead.
+
+Claude paths follow CLAUDE_CONFIG_DIR as Claude Code does: settings.json,
+skills, plugins and transcripts come from that dir, and so does .claude.json
+(the default install keeps it at ~/.claude.json instead).
 `;
 
 async function main(argv: string[]): Promise<number> {
@@ -210,13 +222,7 @@ async function main(argv: string[]): Promise<number> {
     case "restore": {
       const root = projectFlag(flags);
       if (root) return await cmdRestoreProject(root);
-      const harness = flags.target as Harness;
-      if (!harness) {
-        console.error("--target is required: claude|codex|cursor|vscode");
-        return 1;
-      }
-      for (const note of await runRestore(harness)) console.log(note);
-      return 0;
+      return await cmdRestore(flags);
     }
 
     case "version":
@@ -556,10 +562,56 @@ function plansCount(plans: { moved: string[] }[]): number {
   return plans.reduce((n, p) => n + p.moved.length, 0);
 }
 
+/**
+ * The Claude Code installs `--config-dir` and `--all-claude-dirs` name, or the
+ * active one (CLAUDE_CONFIG_DIR, else ~/.claude) when neither is given.
+ */
+function claudeTargets(flags: Flags): { installs: ClaudeInstall[]; error?: string } {
+  const dirs = String(flags["config-dir"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const all = Boolean(flags["all-claude-dirs"]);
+  if (!dirs.length && !all) return { installs: [claudeInstall()] };
+  const out: ClaudeInstall[] = [];
+  for (const dir of dirs) {
+    const install = claudeInstall(dir);
+    if (!existsSync(install.dir)) return { installs: [], error: `--config-dir ${dir}: no such directory` };
+    out.push(install);
+  }
+  if (all) {
+    const found = discoverClaudeInstalls();
+    if (!found.length) return { installs: [], error: "--all-claude-dirs: no ~/.claude* install found" };
+    out.push(...found);
+  }
+  const seen = new Set<string>();
+  return { installs: out.filter((i) => !seen.has(i.dir) && seen.add(i.dir)) };
+}
+
+/** The flags that picked these installs, to repeat in a suggested command. */
+function claudeTargetFlags(flags: Flags): string {
+  return [
+    flags["config-dir"] ? `--config-dir ${flags["config-dir"]}` : "",
+    flags["all-claude-dirs"] ? "--all-claude-dirs" : "",
+  ].filter(Boolean).join(" ");
+}
+
+function targetsForHarness(harness: Harness, flags: Flags): { installs: (ClaudeInstall | undefined)[]; error?: string } {
+  if (harness !== "claude") {
+    if (flags["config-dir"] || flags["all-claude-dirs"]) {
+      return { installs: [], error: "--config-dir and --all-claude-dirs only apply to --target claude" };
+    }
+    return { installs: [undefined] };
+  }
+  return claudeTargets(flags);
+}
+
 async function cmdAdopt(flags: Flags): Promise<number> {
   const harness = (flags.target ?? flags.harness) as Harness | undefined;
   if (!harness || !["claude", "codex", "cursor", "vscode"].includes(harness)) {
     console.error("Specify --target claude|codex|cursor|vscode");
+    return 1;
+  }
+  const targets = targetsForHarness(harness, flags);
+  if (targets.error) {
+    console.error(targets.error);
     return 1;
   }
   const list = (v: unknown) => String(v ?? "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -577,65 +629,90 @@ async function cmdAdopt(flags: Flags): Promise<number> {
     keepSkills: list(flags["keep-skill"]),
     keepPlugins: list(flags["keep-plugin"]),
   };
+  // One header per install whenever the output could be about more than one,
+  // or about one that is not the default.
+  const labelled = targets.installs.length > 1 || targets.installs.some((i) => i && !i.isDefault);
+  const header = (install: ClaudeInstall | undefined) => {
+    if (labelled && install) console.log(`\n== ${installLabel(install)} ==`);
+  };
 
   // A server the router cannot reach is one the router cannot route to. Moving
   // it out of the harness config — or disabling the plugin that supplies it —
   // would silently delete a working capability, usually an OAuth server whose
   // token the harness holds and we do not. Resolve this before planning so the
   // plan itself can exclude them.
-  const unreachable = await unreachableServers();
-  const unreachableNames = new Set(unreachable.keys());
-  // Resolved once for the preview and the apply below: the apply re-reads the
-  // files it rewrites, so this only spares re-reading every harness config.
-  const resolved = await resolveConfig(process.cwd());
-
-  const preview = await runAdopt({
-    harness,
-    cwd: process.cwd(),
-    keep,
-    dryRun: true,
-    unreachable: unreachableNames,
-    resolved,
-    ...extrasOpts,
-  });
-  const total = preview.plans.reduce((n, p) => n + p.moved.length, 0);
-  const extras = preview.extras;
-  const extrasTotal = (extras?.skills.length ?? 0) + (extras?.plugins.length ?? 0);
-  if (!total && !extrasTotal) {
-    console.log(preview.notes.join("\n"));
-    return 0;
-  }
-
-  for (const plan of preview.plans) {
-    if (!plan.moved.length && !plan.kept.length) continue;
-    console.log(`\n${plan.file} [${plan.section}]`);
-    for (const name of plan.moved) {
-      const why = unreachable.get(name);
-      console.log(why ? `  move  ${name}   ⚠ unreachable: ${truncate(why, 60)}` : `  move  ${name}`);
+  type Planned = {
+    install: ClaudeInstall | undefined;
+    resolved: ResolvedConfig;
+    unreachable: Map<string, string>;
+    total: number;
+    extrasTotal: number;
+  };
+  const planned: Planned[] = [];
+  const blocked = new Set<string>();
+  for (const install of targets.installs) {
+    const unreachable = await unreachableServers(install);
+    // Resolved once per install, for the preview and the apply below: the
+    // apply re-reads the files it rewrites, so this only spares re-reading
+    // every harness config.
+    const resolved = await resolveConfig(process.cwd(), { install });
+    const preview = await runAdopt({
+      harness,
+      cwd: process.cwd(),
+      keep,
+      dryRun: true,
+      unreachable: new Set(unreachable.keys()),
+      install,
+      resolved,
+      ...extrasOpts,
+    });
+    const total = preview.plans.reduce((n, p) => n + p.moved.length, 0);
+    const extras = preview.extras;
+    const extrasTotal = (extras?.skills.length ?? 0) + (extras?.plugins.length ?? 0);
+    planned.push({ install, resolved, unreachable, total, extrasTotal });
+    header(install);
+    if (!total && !extrasTotal) {
+      console.log(preview.notes.join("\n"));
+      continue;
     }
-    for (const name of plan.kept) console.log(`  keep  ${name}`);
-  }
 
-  if (extras && extrasTotal) {
-    console.log(`\n${extras.file}`);
-    for (const p of extras.plugins) console.log(`  disable plugin  ${p.name}   (${p.reason})`);
-    for (const s of extras.skills) {
-      const label = s.from ? `${s.from}:${s.name}` : s.name;
-      console.log(`  hide skill      ${label}   → ${s.mode}`);
+    for (const plan of preview.plans) {
+      if (!plan.moved.length && !plan.kept.length) continue;
+      console.log(`\n${plan.file} [${plan.section}]`);
+      for (const name of plan.moved) {
+        const why = unreachable.get(name);
+        console.log(why ? `  move  ${name}   ⚠ unreachable: ${truncate(why, 60)}` : `  move  ${name}`);
+      }
+      for (const name of plan.kept) console.log(`  keep  ${name}`);
     }
-  }
-  if (extras?.skipped.length) {
-    console.log("");
-    for (const note of extras.skipped) console.log(`  skip  ${note}`);
+
+    if (extras && extrasTotal) {
+      console.log(`\n${extras.file}`);
+      for (const p of extras.plugins) console.log(`  disable plugin  ${p.name}   (${p.reason})`);
+      for (const s of extras.skills) {
+        const label = s.from ? `${s.from}:${s.name}` : s.name;
+        console.log(`  hide skill      ${label}   → ${s.mode}`);
+      }
+    }
+    if (extras?.skipped.length) {
+      console.log("");
+      for (const note of extras.skipped) console.log(`  skip  ${note}`);
+    }
+    for (const n of preview.plans.flatMap((p) => p.moved)) if (unreachable.has(n)) blocked.add(n);
   }
 
-  const blocked = preview.plans.flatMap((p) => p.moved).filter((n) => unreachable.has(n));
-  if (blocked.length) {
+  const total = planned.reduce((n, p) => n + p.total, 0);
+  const skillsAndPlugins = planned.reduce((n, p) => n + p.extrasTotal, 0);
+  if (!total && !skillsAndPlugins) return 0;
+
+  if (blocked.size) {
+    const names = [...blocked].join(",");
+    const where = claudeTargetFlags(flags);
     console.log(
-      `\n⚠ The router could not connect to: ${[...new Set(blocked)].join(", ")}.` +
+      `\n⚠ The router could not connect to: ${[...blocked].join(", ")}.` +
         `\n  Adopting them would take a working server out of your harness and put it` +
         `\n  behind a router that cannot reach it. Authenticate them first, or keep them:` +
-        `\n    autorouter adopt --target ${harness} --keep ${[...new Set(blocked)].join(",")}`,
+        `\n    autorouter adopt --target ${harness}${where ? ` ${where}` : ""} --keep ${names}`,
     );
     if (!flags.force) {
       console.log("\n  Re-run with --force to adopt them anyway.");
@@ -650,14 +727,13 @@ async function cmdAdopt(flags: Flags): Promise<number> {
   if (!flags.yes && process.stdin.isTTY) {
     const { createInterface } = await import("node:readline/promises");
     const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const what = [
-      total ? `${total} server(s)` : null,
-      extras?.skills.length ? `${extras.skills.length} skill(s)` : null,
-      extras?.plugins.length ? `${extras.plugins.length} plugin(s)` : null,
-    ].filter(Boolean).join(", ");
-    const answer = ((await ask(rl, `\nMove ${what} behind the router? [y/N] `)) ?? "")
-      .trim()
-      .toLowerCase();
+    const what = [total ? `${total} server(s)` : null, skillsAndPlugins ? `${skillsAndPlugins} skill(s)/plugin(s)` : null]
+      .filter(Boolean)
+      .join(", ");
+    const across = planned.filter((p) => p.total || p.extrasTotal).length;
+    const answer = (
+      (await ask(rl, `\nMove ${what}${across > 1 ? ` across ${across} installs` : ""} behind the router? [y/N] `)) ?? ""
+    ).trim().toLowerCase();
     rl.close();
     if (answer !== "y" && answer !== "yes") {
       console.log("Aborted.");
@@ -665,18 +741,43 @@ async function cmdAdopt(flags: Flags): Promise<number> {
     }
   }
 
-  const result = await runAdopt({
-    harness,
-    cwd: process.cwd(),
-    keep,
-    dryRun: false,
-    unreachable: unreachableNames,
-    resolved,
-    ...extrasOpts,
-  });
-  console.log("");
-  for (const note of result.notes) console.log(note);
-  console.log(`Undo with: autorouter restore --target ${harness}`);
+  for (const p of planned) {
+    if (!p.total && !p.extrasTotal) continue;
+    const result = await runAdopt({
+      harness,
+      cwd: process.cwd(),
+      keep,
+      dryRun: false,
+      unreachable: new Set(p.unreachable.keys()),
+      install: p.install,
+      resolved: p.resolved,
+      ...extrasOpts,
+    });
+    if (labelled && p.install) console.log(`\n== ${installLabel(p.install)} ==`);
+    else console.log("");
+    for (const note of result.notes) console.log(note);
+  }
+  const where = claudeTargetFlags(flags);
+  console.log(`\nUndo with: autorouter restore --target ${harness}${where ? ` ${where}` : ""}`);
+  return 0;
+}
+
+async function cmdRestore(flags: Flags): Promise<number> {
+  const harness = flags.target as Harness;
+  if (!harness) {
+    console.error("--target is required: claude|codex|cursor|vscode");
+    return 1;
+  }
+  const targets = targetsForHarness(harness, flags);
+  if (targets.error) {
+    console.error(targets.error);
+    return 1;
+  }
+  const labelled = targets.installs.length > 1;
+  for (const install of targets.installs) {
+    if (labelled && install) console.log(`\n== ${installLabel(install)} ==`);
+    for (const note of await runRestore(harness, { install })) console.log(note);
+  }
   return 0;
 }
 
@@ -718,20 +819,21 @@ function parseArgs(argv: string[]): {
       // carries the pasted server snippet for `add`. Resolving that by command
       // keeps the flag named the way the vendor docs people copy from name it.
       const boolean =
-        ["raw", "json", "yes", "dry-run", "force", "servers-only", "read-only", "all-scopes", "list-scopes", "device", "manual", "check", "no-reindex", "apply"].includes(name) &&
+        ["raw", "json", "yes", "dry-run", "force", "servers-only", "all-claude-dirs", "read-only", "all-scopes", "list-scopes", "device", "manual", "check", "no-reindex", "apply"].includes(name) &&
         !(name === "json" && command === "add");
       if (boolean) {
         flags[name] = true as any;
-      } else if (inline !== undefined) {
-        flags[name] = inline;
-      } else if (argv[i + 1] === undefined || argv[i + 1]!.startsWith("--")) {
+      } else if (inline === undefined && (argv[i + 1] === undefined || argv[i + 1]!.startsWith("--"))) {
         // Present with no value, which is how `--project` means "this
         // directory". Taking the next argument regardless turned
         // `--project --dry-run` into a project called "--dry-run" and dropped
-        // the dry run, so the adoption was applied for real.
-        flags[name] = undefined;
+        // the dry run, so the adoption was applied for real. A repeated
+        // --config-dir keeps the values it already has.
+        flags[name] = name === "config-dir" ? flags[name] : undefined;
       } else {
-        flags[name] = argv[++i];
+        const value = inline !== undefined ? inline : argv[++i];
+        // --config-dir may be repeated; every occurrence counts.
+        flags[name] = name === "config-dir" && flags[name] && value ? `${flags[name]},${value}` : value;
       }
       continue;
     }
@@ -776,8 +878,8 @@ main(process.argv.slice(2))
  * the persisted catalog rather than reconnecting, so `adopt` stays fast; a stale
  * answer is fine because it only ever adds a warning, never suppresses one.
  */
-async function unreachableServers(): Promise<Map<string, string>> {
-  const catalog = await loadCatalog(process.cwd());
+async function unreachableServers(install?: ClaudeInstall): Promise<Map<string, string>> {
+  const catalog = await loadCatalog(process.cwd(), install);
   const out = new Map<string, string>();
   for (const [name, err] of Object.entries(catalog?.errors ?? {})) out.set(name, err);
   return out;

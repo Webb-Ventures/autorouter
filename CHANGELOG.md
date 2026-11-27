@@ -59,6 +59,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Ctrl-D at a prompt aborts with exit code 1; `doctor` no longer prints
   `-Infinity%` on an empty catalog; `repair` reads Codex's TOML backups; and
   `update` recognises a pnpm project install.
+- `login --read-only` no longer grants Gmail's full-access scopes. Google's
+  scopes are URLs with no word like "write" in them, so 15 of the Gmail MCP
+  server's 20 were classed as read — `https://mail.google.com/` (the whole
+  mailbox, permanent delete included), `gmail.send`, `gmail.compose`,
+  `gmail.drafts`, `gmail.labels`, `gmail.messages` and the settings scopes
+  among them — and `--read-only` would have requested all of those while
+  `--list-scopes` labelled them "read". Under
+  `https://www.googleapis.com/auth/` a scope is now read-only only when it
+  ends in `.readonly` (plus `gmail.metadata` and the `userinfo` pair), and any
+  other URL-shaped scope counts as write unless its path says `read` or
+  `readonly`. `send`, `compose`, `insert`, `import`, `remove` and `edit` are
+  recognised as mutating in every scope style. For Gmail, `--read-only` now
+  requests exactly six scopes.
+- `adopt --target claude` under `CLAUDE_CONFIG_DIR` edited `~/.claude` and
+  `~/.claude.json` instead of the install it ran in.
 - A stdio server that timed out while connecting is now stopped. It was left
   running, one more copy per reindex.
 - Hidden skills are invocable by Claude again. Adopt hid them as
@@ -78,6 +93,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- More than one Claude Code install per machine. Every Claude path follows
+  `CLAUDE_CONFIG_DIR` the way Claude Code does: `settings.json`, `skills/`,
+  `plugins/`, transcripts and `CLAUDE.md` come from that dir, and so does
+  `.claude.json` (the default install keeps it at `~/.claude.json`). A router
+  started under another install indexes that install's skills, servers and
+  plugins, and keeps a catalog of its own. `adopt`/`restore --target claude`
+  take `--config-dir <dir>` (repeatable or comma-separated) and
+  `--all-claude-dirs`. Each install gets its own backup and restores on its
+  own. `doctor` lists every install, whether the router is registered in it,
+  and what each still loads.
 - The `oauth` block of an http server entry is read, in the shape Claude Code
   uses in `.mcp.json` and `~/.claude.json`. It was copied into the router's
   config by `adopt` and then ignored, so a server without dynamic client
@@ -203,7 +228,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rebuild. Every few minutes the next search waited while the router
   reconnected to every server; now only a change to what the catalog reads from
   that file (its servers, this project's entry, trust and `.mcp.json`
-  approvals) counts, and the same goes for `~/.claude/settings.json`. Existing
+  approvals) counts, and the same goes for `~/.claude/settings.json` (for an
+  install under `CLAUDE_CONFIG_DIR`, that install's own two files). Existing
   catalogs rebuild once to pick up the new fingerprint.
 - A stale cached catalog is rebuilt once at startup, not twice. `serve` used to
   discard the background rebuild and run another on the first search.

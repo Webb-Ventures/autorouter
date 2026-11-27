@@ -8,20 +8,30 @@ import { CATALOG_VERSION, matchesPattern } from "./types.ts";
 import { collectSkills } from "./providers/skills.ts";
 import { collectPluginAssets } from "./providers/plugins.ts";
 import { connect, enumerateServer } from "./providers/mcp.ts";
-import { cacheDir, homeDir, stripJsonComments } from "../util/paths.ts";
+import { cacheDir, claudeInstall, claudeSettingsPath, stripJsonComments, type ClaudeInstall } from "../util/paths.ts";
 import { ensureDir, readText, writeText } from "../util/fs.ts";
 import { authHint, authPath } from "../config/oauth.ts";
 import { routerConfigPath } from "../config/write.ts";
 import { listInstalledPlugins } from "../config/adapters/plugins.ts";
 import { mainCheckout } from "../workspace/trust.ts";
 
-export function catalogPath(cwd: string): string {
-  // The slug is only for a human reading the cache dir. It is lossy
-  // ("/a/foo-bar" and "/a/foo/bar" slug the same, as do long paths sharing a
-  // tail), so the hash is what keeps two projects out of one file.
-  const slug = cwd.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_|_$/g, "").slice(-60);
-  const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 10);
-  return join(cacheDir(), `catalog-${slug}-${hash}.json`);
+/**
+ * One catalog per working directory and Claude Code install. Two installs open
+ * in the same repo see different skills, plugins and servers; sharing a file
+ * would have each router rebuild over the other's catalog on every start.
+ */
+export function catalogPath(cwd: string, install: ClaudeInstall = claudeInstall()): string {
+  // The slug and suffix are only for a human reading the cache dir. They are
+  // lossy ("/a/foo-bar" and "/a/foo/bar" slug the same, as do long paths
+  // sharing a tail), so the hash is what keeps two projects, or two installs,
+  // out of one file.
+  const slugOf = (p: string, max: number) => p.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_|_$/g, "").slice(-max);
+  const suffix = install.isDefault ? "" : `@${slugOf(install.dir, 40)}`;
+  const hash = createHash("sha256")
+    .update(install.isDefault ? cwd : `${cwd}\0${install.dir}`)
+    .digest("hex")
+    .slice(0, 10);
+  return join(cacheDir(), `catalog-${slugOf(cwd, 60)}${suffix}-${hash}.json`);
 }
 
 export type BuildOptions = {
@@ -61,7 +71,7 @@ export async function buildCatalog(resolved: ResolvedConfig, opts: BuildOptions 
   // agents included. The installed list is read once here for both of them,
   // per build, so a long-lived process never holds on to a stale copy.
   const includePlugins = config.import.includes("plugins");
-  const plugins = includePlugins ? await listInstalledPlugins() : [];
+  const plugins = includePlugins ? await listInstalledPlugins(resolved.install) : [];
 
   // Skills, plugin assets and servers share nothing, so they are gathered
   // concurrently; the slowest (server connects) no longer waits behind the file
@@ -69,8 +79,8 @@ export async function buildCatalog(resolved: ResolvedConfig, opts: BuildOptions 
   // assets, then servers in config order — because search breaks score ties by
   // position.
   const [skills, pluginAssets, results] = await Promise.all([
-    collectSkills(config.skillPaths, cwd, { includePlugins, plugins }),
-    includePlugins ? collectPluginAssets(plugins) : null,
+    collectSkills(config.skillPaths, cwd, { includePlugins, install: resolved.install, plugins }),
+    includePlugins ? collectPluginAssets(resolved.install, plugins) : null,
     // Servers are enumerated concurrently; one bad server must not block the rest.
     Promise.all(
       servers.map(async (entry) => {
@@ -109,7 +119,7 @@ export async function buildCatalog(resolved: ResolvedConfig, opts: BuildOptions 
     version: CATALOG_VERSION,
     builtAt: Date.now(),
     cwd,
-    sources: await fingerprint(sourceFiles, cwd),
+    sources: await fingerprint(sourceFiles, cwd, resolved.install),
     capabilities: filtered,
     errors,
   };
@@ -141,6 +151,7 @@ const AUTH = "auth:";
 async function fingerprint(
   files: string[],
   cwd: string,
+  install: ClaudeInstall,
   previous: Record<string, string> = {},
 ): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
@@ -150,7 +161,7 @@ async function fingerprint(
         out[key] = (await hasAccessToken(key.slice(AUTH.length))) ? "granted" : "none";
         return;
       }
-      const select = catalogInputs(key);
+      const select = catalogInputs(key, install);
       if (select) {
         out[key] = await contentFingerprint(key, select, cwd, previous[key]);
         return;
@@ -170,7 +181,7 @@ async function fingerprint(
  * Harness files that are mostly *not* about MCP servers, and the parts of them
  * the catalog actually reads.
  *
- * Claude Code rewrites ~/.claude.json every few minutes — startup counters,
+ * Claude Code rewrites its state file (~/.claude.json) every few minutes — startup counters,
  * tips, per-project history — and an mtime fingerprint turned each of those
  * writes into a full rebuild that reconnected to every server, with the next
  * search blocked behind it. These two files are fingerprinted by the inputs
@@ -178,15 +189,22 @@ async function fingerprint(
  * claude.ts, workspace/trust.ts), so only a change to those invalidates the
  * catalog. Everything else keeps the plain stat fingerprint: its contents are
  * catalog input as a whole.
+ *
+ * Both paths belong to one Claude Code install, so they are matched against
+ * the install the catalog was built for. Checked against a different install
+ * the file falls back to its stat, which reads as a change: a rebuild too many,
+ * never one too few.
  */
-function catalogInputs(path: string): ((doc: any, cwd: string) => Promise<unknown>) | undefined {
-  const home = homeDir();
-  if (path === join(home, ".claude.json")) return claudeJsonInputs;
-  if (path === join(home, ".claude", "settings.json")) return settingsInputs;
+function catalogInputs(
+  path: string,
+  install: ClaudeInstall,
+): ((doc: any, cwd: string) => Promise<unknown>) | undefined {
+  if (path === install.claudeJson) return claudeJsonInputs;
+  if (path === claudeSettingsPath(install)) return settingsInputs;
   return undefined;
 }
 
-/** What loadClaude, mcpjsonApproval and adopt read from ~/.claude.json for `cwd`. */
+/** What loadClaude, mcpjsonApproval and adopt read from the install's .claude.json for `cwd`. */
 async function claudeJsonInputs(doc: any, cwd: string): Promise<unknown> {
   const projects = doc?.projects;
   // loadClaude looks the project up by cwd as given, trust.ts by its resolved
@@ -209,7 +227,7 @@ async function claudeJsonInputs(doc: any, cwd: string): Promise<unknown> {
   };
 }
 
-/** The .mcp.json approvals trust.ts reads from ~/.claude/settings.json. */
+/** The .mcp.json approvals trust.ts reads from the install's settings.json. */
 async function settingsInputs(doc: any): Promise<unknown> {
   return {
     enabledMcpjsonServers: doc?.enabledMcpjsonServers,
@@ -305,8 +323,8 @@ async function hasAccessToken(path: string): Promise<boolean> {
   }
 }
 
-export async function loadCatalog(cwd: string): Promise<Catalog | null> {
-  const text = await readText(catalogPath(cwd));
+export async function loadCatalog(cwd: string, install?: ClaudeInstall): Promise<Catalog | null> {
+  const text = await readText(catalogPath(cwd, install));
   if (!text) return null;
   try {
     const catalog = JSON.parse(text) as Catalog;
@@ -366,9 +384,14 @@ export async function pruneCatalogs(
  * changed. Server tool lists can change without any local file changing, which
  * is what the TTL covers.
  */
-export async function isStale(catalog: Catalog, ttlSec: number): Promise<boolean> {
+export async function isStale(
+  catalog: Catalog,
+  ttlSec: number,
+  /** The install the catalog was built for (default: the active one). */
+  install: ClaudeInstall = claudeInstall(),
+): Promise<boolean> {
   if (Date.now() - catalog.builtAt > ttlSec * 1000) return true;
-  const current = await fingerprint(Object.keys(catalog.sources), catalog.cwd, catalog.sources);
+  const current = await fingerprint(Object.keys(catalog.sources), catalog.cwd, install, catalog.sources);
   for (const [file, fp] of Object.entries(catalog.sources)) {
     if (!sameSource(fp, current[file])) return true;
   }
@@ -391,7 +414,9 @@ export async function getCatalog(
 ): Promise<{ catalog: Catalog; rebuilding: Promise<Catalog> | null }> {
   if (!opts.force) {
     const cached = await loadCatalog(resolved.cwd);
-    if (cached && !(await isStale(cached, resolved.config.cacheTtlSec))) return { catalog: cached, rebuilding: null };
+    if (cached && !(await isStale(cached, resolved.config.cacheTtlSec, resolved.install))) {
+      return { catalog: cached, rebuilding: null };
+    }
     if (cached) {
       // Serve the stale catalog now, refresh for next time.
       const rebuilding = buildCatalog(resolved).then(async (fresh) => {
