@@ -108,11 +108,23 @@ export class Router {
    * issued during it still answers from the current index.
    */
   async refresh(opts: { force?: boolean } = {}): Promise<void> {
-    if (this.refreshing) return this.refreshing;
-    if (!opts.force && !(await isStale(this.catalog, this.resolved.config.cacheTtlSec))) return;
+    if (this.refreshing) {
+      const inFlight = this.refreshing;
+      if (!opts.force) return inFlight;
+      // A forced refresh exists to pick up a change the caller just made, and
+      // the build in flight may have read the config before it. Wait it out,
+      // then build again (or share a build that started after this call).
+      await inFlight;
+      if (this.refreshing) return this.refreshing;
+    }
 
-    this.refreshing = (async () => {
+    // The slot is claimed before the first await. Checking staleness first left
+    // a window in which two back-to-back requests both saw no refresh running
+    // and each started a full rebuild.
+    let run!: Promise<void>;
+    run = (async () => {
       try {
+        if (!opts.force && !(await isStale(this.catalog, this.resolved.config.cacheTtlSec))) return;
         // Re-read the config, not just the catalog. The server list is an input
         // to the build, and the thing that most often changed since the last one
         // is precisely that list.
@@ -136,10 +148,11 @@ export class Router {
         // Keep serving what we have. A transient network failure during a
         // background rebuild must not take the router down.
       } finally {
-        this.refreshing = null;
+        if (this.refreshing === run) this.refreshing = null;
       }
     })();
-    return this.refreshing;
+    this.refreshing = run;
+    return run;
   }
 
   /**
@@ -153,16 +166,33 @@ export class Router {
    */
   async retarget(cwd: string): Promise<boolean> {
     if (resolvePath(cwd) === resolvePath(this.resolved.cwd)) return false;
-    if (this.refreshing) await this.refreshing;
-    const resolved = await resolveConfig(resolvePath(cwd));
-    const catalog = await getCatalog(resolved);
-    const index = new HybridIndex(catalog.capabilities, resolved.config);
-    await index.warmEmbeddings();
-    this.resolved = resolved;
-    this.guard = new Guard(resolved.config);
-    this.catalog = catalog;
-    this.index = index;
-    this.pool.setEntries(resolved.servers);
+    while (this.refreshing) await this.refreshing;
+    if (resolvePath(cwd) === resolvePath(this.resolved.cwd)) return false;
+
+    const work = (async () => {
+      const resolved = await resolveConfig(resolvePath(cwd));
+      const catalog = await getCatalog(resolved);
+      const index = new HybridIndex(catalog.capabilities, resolved.config);
+      await index.warmEmbeddings();
+      this.resolved = resolved;
+      this.guard = new Guard(resolved.config);
+      this.catalog = catalog;
+      this.index = index;
+      this.pool.setEntries(resolved.servers);
+    })();
+    // Retargeting holds the refresh slot. Otherwise a refresh that starts while
+    // this is awaiting builds for the old directory and, finishing later,
+    // overwrites the new workspace's state with it.
+    const slot: Promise<void> = work
+      .then(
+        () => {},
+        () => {},
+      )
+      .finally(() => {
+        if (this.refreshing === slot) this.refreshing = null;
+      });
+    this.refreshing = slot;
+    await work;
     return true;
   }
 

@@ -34,6 +34,12 @@ const PAGE_STORE_MAX_ENTRIES = 20;
 const PAGE_STORE_MAX_CHARS = 64 * 1024 * 1024;
 const SAMPLE_ROWS = 3;
 const SAMPLE_ROW_CHARS = 240;
+/**
+ * Budget for an envelope's scalars (has_more, next_cursor, totals). They are
+ * saved nowhere else, so what is cut from the card is gone; a cursor alone can
+ * run past the sample-row limit.
+ */
+const WRAPPER_CHARS = 1200;
 const SAMPLE_STRING_CHARS = 48;
 const MAX_FIELDS = 30;
 
@@ -58,6 +64,16 @@ export class ResultStore {
   private readsFiles = false;
 
   constructor(private config: RouterConfig, private cwd: string) {}
+
+  /**
+   * Follows the router when it re-reads its config or moves to another
+   * workspace. Held from startup, the store kept the old thresholds and kept
+   * judging "is the results directory inside the repo" against the old cwd.
+   */
+  update(config: RouterConfig, cwd: string): void {
+    this.config = config;
+    this.cwd = cwd;
+  }
 
   /** Called once the client has introduced itself. */
   setReadsFiles(value: boolean): void {
@@ -260,12 +276,23 @@ export function classify(text: string): Shape {
   const t = text.trim();
   if (t.startsWith("{") || t.startsWith("[")) {
     try {
-      return classifyValue(JSON.parse(t));
+      const value = JSON.parse(t);
+      // The structured shapes are re-serialized from the parsed value, and a
+      // 64-bit id does not survive that: 1234567890123456789 comes back as
+      // 1234567890123456800. Such a payload is saved verbatim instead.
+      if (!hasUnsafeInteger(value)) return classifyValue(value);
     } catch {
       // Not JSON; fall through to text.
     }
   }
   return { kind: "text", text, markdown: looksLikeMarkdown(t) };
+}
+
+function hasUnsafeInteger(value: unknown): boolean {
+  if (typeof value === "number") return Number.isInteger(value) && !Number.isSafeInteger(value);
+  if (Array.isArray(value)) return value.some(hasUnsafeInteger);
+  if (value && typeof value === "object") return Object.values(value).some(hasUnsafeInteger);
+  return false;
 }
 
 export function classifyValue(value: unknown): Shape {
@@ -351,7 +378,7 @@ function renderFileCard(o: {
   if (o.shape.kind === "rows") {
     lines.push(`file:   ${o.path}  (${fmt(o.shape.rows.length)} rows, one JSON object per line${o.shape.rowsPath ? `, from ${o.shape.rowsPath}` : ""})`);
     if (o.shape.wrapper && Object.keys(o.shape.wrapper).length) {
-      lines.push(`also:   ${clip(JSON.stringify(o.shape.wrapper), SAMPLE_ROW_CHARS)}`);
+      lines.push(`also:   ${clip(JSON.stringify(o.shape.wrapper), WRAPPER_CHARS)}`);
     }
     lines.push(`fields: ${renderFields(inferFields(o.shape.rows))}`);
     const samples = o.shape.rows.slice(0, SAMPLE_ROWS).map(sampleRow);
@@ -403,6 +430,11 @@ function renderPage(
           ? "pretty-printed JSON"
           : "text";
     head.push(`~${fmt(first.tokens)} tokens — too large to inline (${what}).`);
+    // Only the rows are paged. The envelope around them (has_more, next_cursor)
+    // has to be stated here or the caller cannot fetch the next page upstream.
+    if (first.shape.kind === "rows" && first.shape.wrapper && Object.keys(first.shape.wrapper).length) {
+      head.push(`also: ${clip(JSON.stringify(first.shape.wrapper), WRAPPER_CHARS)}`);
+    }
     if (first.warning) head.push(`Untrusted data: ${first.warning}`);
   }
   head.push(`Showing characters ${fmt(start)}–${fmt(end)} of ${fmt(text.length)}:`);

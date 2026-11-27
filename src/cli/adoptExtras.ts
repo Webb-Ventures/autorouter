@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { exists, readText, writeText } from "../util/fs.ts";
 import { homeDir, stripJsonComments } from "../util/paths.ts";
-import { listInstalledPlugins } from "../config/adapters/plugins.ts";
+import { listInstalledPlugins, readPluginServers } from "../config/adapters/plugins.ts";
 import { collectSkills } from "../catalog/providers/skills.ts";
 
 /**
@@ -154,7 +154,25 @@ export async function planExtras(opts: {
   return plan;
 }
 
+/**
+ * Throws when the settings file exists but cannot be parsed.
+ *
+ * readSettings() reports that as "no settings", which is right for planning
+ * and wrong for writing: the file was then replaced by one holding only the
+ * two keys set here, dropping its hooks and permissions.
+ */
+export async function assertSettingsWritable(file: string): Promise<void> {
+  const text = await readText(file);
+  if (!text?.trim()) return;
+  try {
+    JSON.parse(stripJsonComments(text));
+  } catch {
+    throw new Error(`${file} is not valid JSON — fix it before adopting skills or plugins.`);
+  }
+}
+
 export async function applyExtras(plan: ExtrasPlan): Promise<void> {
+  await assertSettingsWritable(plan.file);
   const settings = (await readSettings(plan.file)) ?? {};
   settings.skillOverrides = { ...settings.skillOverrides };
   settings.enabledPlugins = { ...settings.enabledPlugins };
@@ -193,24 +211,5 @@ export async function pluginsWithServers(): Promise<
 
 /** Server names a plugin contributes, read the same way loadPluginServers does. */
 async function pluginServerNames(root: string): Promise<string[]> {
-  const manifestText = await readText(join(root, ".claude-plugin", "plugin.json"));
-  if (!manifestText) return [];
-  let manifest: { mcpServers?: string | Record<string, unknown> };
-  try {
-    manifest = JSON.parse(stripJsonComments(manifestText));
-  } catch {
-    return [];
-  }
-  if (!manifest.mcpServers) return [];
-  if (typeof manifest.mcpServers !== "string") return Object.keys(manifest.mcpServers);
-
-  const rel = manifest.mcpServers.replace(/^\.\//, "");
-  const text = await readText(join(root, rel));
-  if (!text) return [];
-  try {
-    const loaded = JSON.parse(stripJsonComments(text));
-    return Object.keys(loaded.mcpServers ?? loaded ?? {});
-  } catch {
-    return [];
-  }
+  return Object.keys(await readPluginServers(root));
 }

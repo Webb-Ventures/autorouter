@@ -39,14 +39,23 @@ export function tokenize(text: string): string[] {
   return out;
 }
 
-/** Crude suffix stripping — enough to unify plural/gerund forms. */
+/**
+ * Crude suffix stripping — enough to unify plural/gerund forms.
+ *
+ * Every inflection of a word has to land on the same stem as its base form,
+ * or a query for "issues" misses a tool named "create_issue". So "-es" is only
+ * a suffix after a sibilant ("boxes", "searches"); elsewhere the plural is a
+ * bare "-s" ("issues" -> "issue"), and a final "e" is then dropped from both
+ * forms so "create", "created" and "creating" agree.
+ */
 export function stem(word: string): string {
   if (word.length <= 4) return word;
-  for (const suffix of ["ing", "ies", "ed", "es", "s"]) {
-    if (word.endsWith(suffix) && word.length - suffix.length >= 3) {
-      const base = word.slice(0, -suffix.length);
-      return suffix === "ies" ? `${base}y` : base;
-    }
-  }
-  return word;
+  let base = word;
+  if (word.endsWith("ies") && word.length >= 6) base = `${word.slice(0, -3)}y`;
+  else if (word.endsWith("ing") && word.length >= 6) base = word.slice(0, -3);
+  else if (word.endsWith("ed") && word.length >= 5) base = word.slice(0, -2);
+  else if (/(?:ss|x|z|ch|sh)es$/.test(word)) base = word.slice(0, -2);
+  else if (word.endsWith("s") && !/(?:ss|us|is)$/.test(word)) base = word.slice(0, -1);
+  if (base.length > 4 && base.endsWith("e") && !base.endsWith("ee")) base = base.slice(0, -1);
+  return base;
 }

@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import type { ResolvedConfig } from "../config/resolve.ts";
 import type { Catalog, Capability } from "./types.ts";
 import { CATALOG_VERSION, matchesPattern } from "./types.ts";
@@ -9,10 +10,15 @@ import { connect, enumerateServer } from "./providers/mcp.ts";
 import { cacheDir } from "../util/paths.ts";
 import { ensureDir, readText, writeText } from "../util/fs.ts";
 import { authHint, authPath } from "../config/oauth.ts";
+import { routerConfigPath } from "../config/write.ts";
 
 export function catalogPath(cwd: string): string {
-  const slug = cwd.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_|_$/g, "").slice(-80);
-  return join(cacheDir(), `catalog-${slug}.json`);
+  // The slug is only for a human reading the cache dir. It is lossy
+  // ("/a/foo-bar" and "/a/foo/bar" slug the same, as do long paths sharing a
+  // tail), so the hash is what keeps two projects out of one file.
+  const slug = cwd.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_|_$/g, "").slice(-60);
+  const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 10);
+  return join(cacheDir(), `catalog-${slug}-${hash}.json`);
 }
 
 export async function buildCatalog(resolved: ResolvedConfig): Promise<Catalog> {
@@ -22,7 +28,9 @@ export async function buildCatalog(resolved: ResolvedConfig): Promise<Catalog> {
   // The router's own config, plus every harness config it imports from — a
   // server appearing in one of those is the most common way this catalog goes
   // out of date.
-  const sourceFiles: string[] = [...(configPath ? [configPath] : []), ...resolved.sources];
+  // With no config yet, watch where one would be created: `autorouter add`
+  // writes it there, and a running router has to notice.
+  const sourceFiles: string[] = [configPath ?? routerConfigPath(null), ...resolved.sources];
 
   // A grant is a real input to the catalog: an unauthorized server contributes
   // zero capabilities, so obtaining a token changes the result as surely as
@@ -39,9 +47,13 @@ export async function buildCatalog(resolved: ResolvedConfig): Promise<Catalog> {
   capabilities.push(...skills.capabilities);
   sourceFiles.push(...skills.sources);
 
-  const pluginAssets = await collectPluginAssets();
-  capabilities.push(...pluginAssets.capabilities);
-  sourceFiles.push(...pluginAssets.sources);
+  // Same switch as plugin skills above: leaving "plugins" out of `import`
+  // means none of a plugin's contents are indexed, commands and agents included.
+  if (config.import.includes("plugins")) {
+    const pluginAssets = await collectPluginAssets();
+    capabilities.push(...pluginAssets.capabilities);
+    sourceFiles.push(...pluginAssets.sources);
+  }
 
   // Servers are enumerated concurrently; one bad server must not block the rest.
   const results = await Promise.all(
@@ -122,7 +134,7 @@ export async function loadCatalog(cwd: string): Promise<Catalog | null> {
   if (!text) return null;
   try {
     const catalog = JSON.parse(text) as Catalog;
-    return catalog.version === CATALOG_VERSION ? catalog : null;
+    return catalog.version === CATALOG_VERSION && catalog.cwd === cwd ? catalog : null;
   } catch {
     return null;
   }

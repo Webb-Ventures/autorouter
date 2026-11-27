@@ -1,5 +1,6 @@
 import { readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { parse as parseToml } from "smol-toml";
 import { exists, readText, writeText } from "../util/fs.ts";
 import { homeDir, stripJsonComments } from "../util/paths.ts";
 import { resolveConfig } from "../config/resolve.ts";
@@ -236,6 +237,12 @@ function parse(text: string): Doc | null {
   try {
     const v = JSON.parse(stripJsonComments(text));
     return v && typeof v === "object" ? v : null;
+  } catch {
+    // Not JSON. Codex's config.toml is backed up too, and reading it as
+    // nothing lost the servers Codex had registered globally.
+  }
+  try {
+    return parseToml(text) as Doc;
   } catch {
     return null;
   }

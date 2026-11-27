@@ -181,6 +181,7 @@ export async function serve(opts: { cwd?: string } = {}): Promise<void> {
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
+    results.update(router.resolved.config, router.resolved.cwd);
     try {
       switch (name) {
         case "find_capabilities":

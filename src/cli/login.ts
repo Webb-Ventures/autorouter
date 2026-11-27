@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { OAuthServerInfo } from "@modelcontextprotocol/sdk/client/auth.js";
 import { resolveConfig } from "../config/resolve.ts";
+import { ask } from "../util/ask.ts";
 import { serializeRefresh } from "../config/refresh.ts";
 import { deviceEndpoint, looksHeadless, runDeviceFlow } from "./device.ts";
 import {
@@ -147,9 +148,9 @@ export async function runLogin(opts: {
 
   // Read before --force wipes the file, so the replacement grant can inherit
   // the narrowing the old one was given.
-  const { requestedScope: previousScope, pinnedScope: previousPin } = await readAuth(entry.name);
-  if (opts.force) await clearAuth(entry.name);
-  else if (await hasAuth(entry.name)) {
+  const previous = await readAuth(entry.name);
+  const { requestedScope: previousScope, pinnedScope: previousPin } = previous;
+  if (!opts.force && (await hasAuth(entry.name))) {
     // A scope request against an existing grant is a no-op without --force, and
     // saying only "already has a grant" reads as though the narrowing applied.
     const asked = opts.readOnly
@@ -174,6 +175,26 @@ export async function runLogin(opts: {
     return { ok: false, message: "--device and --manual are different flows; pick one." };
   }
 
+  // --force replaces a grant; it must not be a way to lose one. The old grant
+  // is cleared only now, after the arguments have been checked, and put back
+  // if the new login does not produce a token (a timeout, a refused scope, a
+  // closed browser tab).
+  if (opts.force) await clearAuth(entry.name);
+  const keepPrevious = async () => {
+    if (opts.force && previous.tokens?.access_token && !(await hasAuth(entry.name))) {
+      await writeAuth(entry.name, {}, previous);
+    }
+  };
+  try {
+    const result = await attempt(entry);
+    if (!result.ok) await keepPrevious();
+    return result;
+  } catch (err) {
+    await keepPrevious();
+    throw err;
+  }
+
+  async function attempt(entry: Extract<ServerEntry, { transport: "http" }>): Promise<LoginResult> {
   const port = opts.port ?? configured?.callbackPort ?? CALLBACK_PORT;
   // --client-secret on its own completes a client whose id is in the config:
   // that is the arrangement for a secret kept out of the file.
@@ -183,6 +204,10 @@ export async function runLogin(opts: {
       client_id: clientId,
       ...(opts.clientSecret ? { client_secret: opts.clientSecret } : {}),
     });
+    // A client the user registered by hand is used as given. Without this the
+    // device flow saw a client it had not registered itself and replaced it
+    // with a dynamically registered one whenever the provider offered that.
+    await writeAuth(entry.name, { deviceClient: true });
   } else if (opts.clientSecret) {
     return {
       ok: false,
@@ -226,6 +251,7 @@ export async function runLogin(opts: {
   }
   if (mode.announce) console.log(mode.announce);
   return await authorize(entry, port, want, mode.kind);
+  }
 }
 
 /**
@@ -542,7 +568,9 @@ async function readPastedCode(expectedState: string | undefined): Promise<string
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     for (let attempt = 0; attempt < 3; attempt++) {
-      const answer = (await rl.question("Paste the full redirect URL (or just the code): ")).trim();
+      const line = await ask(rl, "Paste the full redirect URL (or just the code): ");
+      if (line === null) break;
+      const answer = line.trim();
       if (!answer) continue;
       const parsed = parsePastedRedirect(answer, expectedState);
       if ("code" in parsed) return parsed.code;
@@ -577,11 +605,22 @@ export function parsePastedRedirect(
 }
 
 function openBrowser(url: string): void {
-  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+  // `start` is a cmd.exe builtin, not a program, so it cannot be spawned; the
+  // URL handler is reachable directly and needs no shell quoting.
+  const [cmd, args] =
+    process.platform === "darwin"
+      ? ["open", [url]]
+      : process.platform === "win32"
+        ? ["rundll32", ["url.dll,FileProtocolHandler", url]]
+        : ["xdg-open", [url]];
   try {
     // Detached and ignored: the browser must outlive this command, and its
     // stdio must not interleave with ours.
-    spawn(cmd, [url], { detached: true, stdio: "ignore" }).unref();
+    const child = spawn(cmd as string, args as string[], { detached: true, stdio: "ignore" });
+    // A missing opener is reported as an `error` event, not a throw, and an
+    // unhandled one kills the login that had already printed its URL.
+    child.on("error", () => {});
+    child.unref();
   } catch {
     // Headless box, or no handler registered. The URL was already printed.
   }

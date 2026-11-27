@@ -17,6 +17,8 @@ import type { CapabilityKind } from "./catalog/types.ts";
 import { loadCatalog } from "./catalog/build.ts";
 import { tuneConnectionRacing } from "./util/net.ts";
 import { absPath } from "./util/paths.ts";
+import { ask } from "./util/ask.ts";
+import { which } from "./util/proc.ts";
 import { workspaceRoot } from "./workspace/root.ts";
 import { cmdAdoptProject, cmdApprove, cmdRepair, cmdRestoreProject, projectFlag } from "./cli/project.ts";
 
@@ -236,14 +238,16 @@ async function main(argv: string[]): Promise<number> {
 }
 
 async function cmdAdd(name: string | undefined, flags: Flags, rest: string[]): Promise<number> {
+  // Passed whole, "npx -y foo" was spawned as a program of that name.
+  const fromFlag = flags.command ? splitCommand(flags.command) : null;
   try {
     const result = await runAdd({
       name,
       url: flags.url as string | undefined,
       // Either form of stdio entry: --command "npx -y foo" as one string, or the
       // argv after a bare --, which is what people copy out of a README.
-      command: (flags.command as string | undefined) ?? rest[0],
-      args: flags.command ? undefined : rest.slice(1),
+      command: fromFlag ? fromFlag[0] : rest[0],
+      args: fromFlag ? fromFlag.slice(1) : rest.slice(1),
       json: flags.json as string | undefined,
     }, process.cwd(), {
       // stderr, so stdout carries only the result line.
@@ -647,9 +651,9 @@ async function cmdAdopt(flags: Flags): Promise<number> {
       extras?.skills.length ? `${extras.skills.length} skill(s)` : null,
       extras?.plugins.length ? `${extras.plugins.length} plugin(s)` : null,
     ].filter(Boolean).join(", ");
-    const answer = (
-      await rl.question(`\nMove ${what} behind the router? [y/N] `)
-    ).trim().toLowerCase();
+    const answer = ((await ask(rl, `\nMove ${what} behind the router? [y/N] `)) ?? "")
+      .trim()
+      .toLowerCase();
     rl.close();
     if (answer !== "y" && answer !== "yes") {
       console.log("Aborted.");
@@ -715,6 +719,12 @@ function parseArgs(argv: string[]): {
         flags[name] = true as any;
       } else if (inline !== undefined) {
         flags[name] = inline;
+      } else if (argv[i + 1] === undefined || argv[i + 1]!.startsWith("--")) {
+        // Present with no value, which is how `--project` means "this
+        // directory". Taking the next argument regardless turned
+        // `--project --dry-run` into a project called "--dry-run" and dropped
+        // the dry run, so the adoption was applied for real.
+        flags[name] = undefined;
       } else {
         flags[name] = argv[++i];
       }
@@ -724,6 +734,18 @@ function parseArgs(argv: string[]): {
     else positionals.push(arg);
   }
   return { command, positionals, flags, rest };
+}
+
+/**
+ * Splits `--command "npx -y foo"` into a command and its arguments, honouring
+ * quotes. A string that is itself an executable (a path with spaces in it) is
+ * left whole.
+ */
+function splitCommand(value: string): string[] {
+  if (!/\s/.test(value.trim()) || which(value)) return [value];
+  const out: string[] = [];
+  for (const m of value.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)) out.push(m[1] ?? m[2] ?? m[3]!);
+  return out;
 }
 
 function splitOnce(s: string, sep: string): [string, string | undefined] {

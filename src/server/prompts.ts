@@ -167,9 +167,12 @@ export function promptMessages(
 
 function substitute(body: string, raw: string): string {
   const positional = raw.split(/\s+/).filter(Boolean);
-  return body
-    .replace(/\$ARGUMENTS\b/g, raw)
-    .replace(/\$(\d)\b/g, (_, d: string) => positional[Number(d) - 1] ?? "");
+  // One pass with a replacer function. Two passes re-scanned the inserted
+  // arguments for `$1`, and a string replacement interprets `$&` and `$$` in
+  // them, so arguments containing a dollar sign were rewritten.
+  return body.replace(/\$ARGUMENTS\b|\$(\d)\b/g, (_, d: string | undefined) =>
+    d === undefined ? raw : (positional[Number(d) - 1] ?? ""),
+  );
 }
 
 /**

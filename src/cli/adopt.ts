@@ -5,8 +5,10 @@ import { homeDir, stripJsonComments } from "../util/paths.ts";
 import { resolveConfig } from "../config/resolve.ts";
 import { upsertProjectServers, upsertServers } from "../config/write.ts";
 import type { Harness } from "./init.ts";
+import { isSelfReference, normalizeServer } from "../config/adapters/shared.ts";
 import {
   applyExtras,
+  assertSettingsWritable,
   planExtras,
   settingsPath,
   type ExtrasPlan,
@@ -73,7 +75,12 @@ export async function runAdopt(opts: {
 
   const apply = (site: AdoptPlan, entries: Record<string, any>, target = adopted) => {
     for (const [name, spec] of Object.entries(entries)) {
-      if (keep.has(name)) {
+      // The router's own registration stays in the harness whatever it is
+      // called. Matching the name alone moved an entry called "router" out,
+      // after which resolveConfig drops it as a self-reference: the harness
+      // was left with no router at all.
+      const entry = spec && typeof spec === "object" ? normalizeServer(name, spec, "adopt") : null;
+      if (keep.has(name) || (entry && isSelfReference(entry))) {
         site.kept.push(name);
         continue;
       }
@@ -174,6 +181,9 @@ export async function runAdopt(opts: {
   // settings.json is mutated by applyExtras, so it belongs in the same backup
   // as the server moves — one `restore` has to undo the whole adoption.
   if (extrasCount) {
+    // Checked before anything is written, so a settings file that cannot be
+    // updated stops the adoption whole rather than halfway.
+    await assertSettingsWritable(settingsPath());
     const text = await readText(settingsPath());
     if (text !== null) backup[settingsPath()] = text;
   }
@@ -184,6 +194,15 @@ export async function runAdopt(opts: {
   await ensureDir(join(backupPath, ".."));
   await writeText(backupPath, `${JSON.stringify({ harness: opts.harness, files: backup }, null, 2)}\n`);
 
+  // The router's config is written first. If that fails (it throws on a config
+  // it cannot parse) the harness files are untouched; the other order removed
+  // the servers from the harness and then failed to record them anywhere. A
+  // failure after this point leaves a server in both places, which is harmless.
+  if (Object.keys(adopted).length) await upsertServers(adopted, { configPath: resolved.configPath });
+  if (Object.keys(adoptedProject).length) {
+    await upsertProjectServers(resolve(opts.cwd), adoptedProject, { configPath: resolved.configPath });
+  }
+
   const touched = new Set(plans.filter((p) => p.moved.length).map((p) => p.file));
   for (const file of touched) {
     const config = docs.get(file);
@@ -191,11 +210,6 @@ export async function runAdopt(opts: {
       file,
       file.endsWith(".toml") ? stringifyToml(config) : `${JSON.stringify(config, null, 2)}\n`,
     );
-  }
-
-  if (Object.keys(adopted).length) await upsertServers(adopted, { configPath: resolved.configPath });
-  if (Object.keys(adoptedProject).length) {
-    await upsertProjectServers(resolve(opts.cwd), adoptedProject, { configPath: resolved.configPath });
   }
   if (extras && extrasCount) await applyExtras(extras);
 

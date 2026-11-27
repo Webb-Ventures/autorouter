@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { tokenize } from "../src/index/tokenize.ts";
+import { tokenize, stem } from "../src/index/tokenize.ts";
 import { Bm25Index } from "../src/index/bm25.ts";
 import { parseFrontmatter, keywordsFrom } from "../src/catalog/frontmatter.ts";
 import { matchesPattern, estimateTokens } from "../src/catalog/types.ts";
@@ -35,7 +35,7 @@ function cap(id: string, name: string, description: string, keywords: string[]):
 
 describe("tokenize", () => {
   test("splits snake_case and camelCase into words", () => {
-    expect(tokenize("execute_sql")).toContain("execute");
+    expect(tokenize("execute_sql")).toContain(stem("execute"));
     expect(tokenize("execute_sql")).toContain("sql");
     expect(tokenize("listDashboards")).toContain("list");
     expect(tokenize("listDashboards")).toContain("dashboard");

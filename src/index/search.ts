@@ -72,8 +72,13 @@ export class HybridIndex {
       }
     }
 
-    const normLex = normalize(lexical);
-    const normSem = normalize(semantic);
+    // BM25 only reports documents that matched, so its weakest entry is still
+    // a hit: scale by the maximum. Min-max would give it exactly 0 and the
+    // `score <= 0` filter below would drop a real match (with two hits, the
+    // second vanished and the first looked like the only one). Cosine covers
+    // every document, so min-max is right there.
+    const normLex = normalize(lexical, true);
+    const normSem = normalize(semantic, false);
     const w = semantic.size ? this.config.lexicalWeight : 1;
 
     const scored: Scored[] = [];
@@ -99,8 +104,12 @@ export class HybridIndex {
   }
 }
 
-/** Min-max to [0,1] so lexical and cosine scores are comparable before fusing. */
-function normalize(scores: Map<string, number>): Map<string, number> {
+/**
+ * Scales to [0,1] so lexical and cosine scores are comparable before fusing.
+ * `fromZero` keeps 0 as the floor (for scores that are all positive matches);
+ * otherwise the smallest score is the floor.
+ */
+function normalize(scores: Map<string, number>, fromZero: boolean): Map<string, number> {
   if (scores.size === 0) return scores;
   let min = Infinity;
   let max = -Infinity;
@@ -108,6 +117,7 @@ function normalize(scores: Map<string, number>): Map<string, number> {
     if (v < min) min = v;
     if (v > max) max = v;
   }
+  if (fromZero) min = Math.min(min, 0);
   const range = max - min;
   const out = new Map<string, number>();
   for (const [k, v] of scores) out.set(k, range === 0 ? 1 : (v - min) / range);

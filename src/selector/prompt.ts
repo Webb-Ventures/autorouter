@@ -77,6 +77,17 @@ export function parseSelections(raw: string, validIds: Set<string>): Selection[]
   return out;
 }
 
+/**
+ * Whether the response is a well-formed, deliberately empty selection, as
+ * opposed to output that could not be parsed or named only unknown ids.
+ */
+export function isEmptySelection(raw: string): boolean {
+  const json = extractJson(raw);
+  if (!json) return false;
+  const list = Array.isArray(json) ? json : (json as any).selections;
+  return Array.isArray(list) && list.length === 0;
+}
+
 /** Tolerates the model dropping a prefix, e.g. "supabase/execute_sql". */
 function resolveId(id: string, validIds: Set<string>): string | null {
   if (validIds.has(id)) return id;

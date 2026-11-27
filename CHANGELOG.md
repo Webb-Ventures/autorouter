@@ -8,6 +8,57 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Search no longer drops real matches. The weakest lexical hit was always
+  discarded (with two hits, one vanished and the other could be auto-run as the
+  "only match"); plural and inflected queries (`issues`, `created`) missed
+  singular tool names; and a tool name typed without its separator
+  (`executesql`) matched nothing.
+- Schema compaction keeps parameters named `title`, `example` or `examples`.
+  They were deleted while `required` still listed them.
+- A selector answer that could not be parsed is no longer cached as "nothing
+  matched" for the rest of the session, and the cache respects the result limit.
+- Prompt arguments containing `$1`, `$$` or `$&` are passed through unchanged,
+  and a `description:` wrapped over several frontmatter lines is read whole.
+- A catalog refresh closes only the connections whose server changed or was
+  removed. It closed all of them, failing whatever call was in flight.
+- Concurrent requests share one catalog rebuild, a forced refresh waits for a
+  build that started before it, and a refresh can no longer overwrite the
+  workspace a retarget just switched to.
+- Downstream stderr is drained. It was piped and never read, so a server that
+  logged enough blocked on its next line and stopped answering.
+- Timeouts hold: the selector CLI's is enforced even when a descendant keeps
+  its pipes open, and `startup_timeout_sec` above 60 is no longer capped by the
+  SDK's default (which also cut `autorouter login` for a local server to 60s).
+- A `tools/list` that fails is reported as that server's error instead of being
+  cached as "no tools" until the TTL ran out.
+- Two directories can no longer share a catalog cache file (`/a/foo-bar` and
+  `/a/foo/bar` did), and a router config created after startup is noticed.
+  Cache files are renamed, so each project rebuilds once.
+- Saved results keep 64-bit ids exact, page mode shows the envelope
+  (`has_more`, `next_cursor`), and spill settings follow a config change.
+- Servers with the same command but a different `env` (or the same URL with
+  different headers) are separate servers. They were merged into whichever was
+  registered first. Deduping can no longer produce two servers with one name,
+  and a `login` command survives when a harness registers the same server.
+- Plugins that declare servers in a root `.mcp.json` are routed. They were not
+  read, and `adopt` then disabled the plugin as "skills only".
+  `${CLAUDE_PLUGIN_ROOT}` is resolved in `env`, `cwd`, `url` and headers too,
+  and correctly when the router itself runs as a plugin.
+- `adopt` writes the router's config before it removes anything from a harness,
+  refuses to rewrite a `settings.json` it cannot parse, and leaves the router's
+  own registration in place whatever it is named.
+- Config files and OAuth grants are written atomically (through symlinks,
+  keeping permissions), so an interrupt or a concurrent reader never sees a
+  truncated file.
+- `login --force` keeps the old grant until the new login succeeds. A missing
+  browser opener no longer crashes the login (it always did on Windows), a
+  client given with `--client-id` is not replaced in the device flow, and a
+  200 response carrying an error is not stored as a token.
+- `--project --dry-run` no longer treats `--dry-run` as the project and applies
+  for real, and `--command "npx -y foo"` is split into a command and arguments.
+- Ctrl-D at a prompt aborts with exit code 1; `doctor` no longer prints
+  `-Infinity%` on an empty catalog; `repair` reads Codex's TOML backups; and
+  `update` recognises a pnpm project install.
 - A stdio server that timed out while connecting is now stopped. It was left
   running, one more copy per reindex.
 - Hidden skills are invocable by Claude again. Adopt hid them as

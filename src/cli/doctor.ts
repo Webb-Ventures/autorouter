@@ -150,7 +150,7 @@ export async function runDoctor(cwd: string): Promise<string> {
   lines.push("## Context cost");
   lines.push(`  exposing everything: ~${full.toLocaleString()} tokens`);
   lines.push(`  router surface:      ~${routerSurface.toLocaleString()} tokens`);
-  lines.push(`  best case:           ~${(full - routerSurface).toLocaleString()} tokens saved (${Math.round(((full - routerSurface) / full) * 100)}%)`);
+  lines.push(`  best case:           ~${(full - routerSurface).toLocaleString()} tokens saved (${full > 0 ? Math.round(((full - routerSurface) / full) * 100) : 0}%)`);
 
   // Per harness, not summed. A session runs in exactly one harness, so charging
   // Claude Code for a server that is only still registered in Cursor makes the
