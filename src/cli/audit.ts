@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { homeDir, readJson } from "../util/paths.ts";
+import { claudeInstall, claudeSettingsPath, installLabel, readJson } from "../util/paths.ts";
 import {
   eachEntry,
   hookRunOf,
@@ -408,7 +408,7 @@ export async function currentCompactWindow(
   const settings = await readJson<{
     autoCompactWindow?: unknown;
     modelSettings?: Record<string, { autoCompactWindow?: unknown }>;
-  }>(join(homeDir(), ".claude", "settings.json"));
+  }>(claudeSettingsPath());
   const valid = (v: unknown) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : null);
   if (model && settings?.modelSettings) {
     const key = Object.keys(settings.modelSettings)
@@ -584,7 +584,7 @@ export function renderAudit(r: AuditReport, opts: { days?: number; project?: str
   );
   if (r.unparsedLines) lines.push(`unparsed lines skipped: ${r.unparsedLines}`);
   if (!r.calls) {
-    lines.push("", "No API calls found in ~/.claude/projects for this range.");
+    lines.push("", `No API calls found in ${installLabel(claudeInstall())}/projects for this range.`);
     return lines.join("\n");
   }
 
@@ -617,7 +617,7 @@ export function renderAudit(r: AuditReport, opts: { days?: number; project?: str
     lines.push("", "## Compaction window (replay, API-equivalent cost)");
     lines.push(
       w.current
-        ? `  autoCompactWindow: ${w.current} (${w.source} in ~/.claude/settings.json${w.model ? `, for ${w.model}, the model most calls used` : ""})`
+        ? `  autoCompactWindow: ${w.current} (${w.source} in ${installLabel(claudeInstall())}/settings.json${w.model ? `, for ${w.model}, the model most calls used` : ""})`
         : `  autoCompactWindow: unset — changes below are relative to ${fmtTokens(w.baseline)}`,
     );
     lines.push("     window    change  compactions  avg context");
@@ -631,7 +631,7 @@ export function renderAudit(r: AuditReport, opts: { days?: number; project?: str
       const rec = w.sweep.find((s) => s.window === w.recommended)!;
       lines.push(
         "",
-        `  → set ${w.source?.startsWith("modelSettings") ? `${w.source}.autoCompactWindow` : `"autoCompactWindow"`} to ${w.recommended} in ~/.claude/settings.json (est. ${(rec.change * 100).toFixed(0)}% usage)`,
+        `  → set ${w.source?.startsWith("modelSettings") ? `${w.source}.autoCompactWindow` : `"autoCompactWindow"`} to ${w.recommended} in ${installLabel(claudeInstall())}/settings.json (est. ${(rec.change * 100).toFixed(0)}% usage)`,
       );
     }
     lines.push(

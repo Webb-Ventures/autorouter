@@ -11,6 +11,7 @@ import { tokensOf } from "../util/compact.ts";
 import { recentHookRuns } from "../util/transcripts.ts";
 import { planProjectAdopt } from "../workspace/project.ts";
 import { formatRepairPlan, planRepair } from "./repair.ts";
+import { claudeInstall, discoverClaudeInstalls, installLabel, readJson, type ClaudeInstall } from "../util/paths.ts";
 import {
   ancestorCommandLines,
   claudeDirectServers,
@@ -102,19 +103,65 @@ export async function runDoctor(cwd: string): Promise<string> {
   lines.push(embedder ? `  status:   ready (${embedder.id})` : "  status:   disabled — lexical BM25 only");
   lines.push("");
 
+  // Every Claude Code install on this machine is its own harness config: its
+  // own .claude.json, settings.json and skills. Reporting only the active one
+  // hides an install that was never adopted.
+  const installs = claudeInstallsForDoctor(resolved.install);
+  if (installs.length > 1 || !installs[0]!.isDefault) {
+    lines.push(`## Claude Code installs (${installs.length})`);
+    for (const install of installs) {
+      const registered = Boolean(
+        (await readJson<{ mcpServers?: Record<string, unknown> }>(install.claudeJson))?.mcpServers?.autorouter,
+      );
+      const active = install.dir === resolved.install.dir ? "  (active)" : "";
+      lines.push(`  ${installLabel(install)}${active}`);
+      lines.push(`    state:  ${install.claudeJson}`);
+      lines.push(
+        registered
+          ? "    router: registered"
+          : `    router: NOT registered → CLAUDE_CONFIG_DIR=${installLabel(install)} autorouter init --target claude`,
+      );
+    }
+    lines.push("");
+  }
+
   // Routing only saves anything if the servers it routes to are no longer
   // registered directly in the harness. Anything still listed there is loaded
   // in full on every turn, router or not, so report it as unrealized savings.
-  const stillDirect = new Map<Harness, string[]>();
-  /** Skills and plugins the harness still loads itself, by harness. */
-  const stillLoaded = new Map<Harness, { skills: string[]; plugins: string[] }>();
+  type Target = { key: string; harness: Harness; install?: ClaudeInstall; adopt: string };
+  const targets: Target[] = [];
   for (const harness of HARNESSES) {
+    if (harness !== "claude") {
+      targets.push({ key: harness, harness, adopt: `autorouter adopt --target ${harness}` });
+      continue;
+    }
+    for (const install of installs) {
+      const active = install.dir === resolved.install.dir;
+      targets.push({
+        key: installs.length > 1 ? `claude ${installLabel(install)}` : "claude",
+        harness,
+        install,
+        adopt: `autorouter adopt --target claude${active ? "" : ` --config-dir ${installLabel(install)}`}`,
+      });
+    }
+  }
+  const stillDirect = new Map<string, string[]>();
+  /** Skills and plugins the harness still loads itself, by target. */
+  const stillLoaded = new Map<string, { skills: string[]; plugins: string[] }>();
+  for (const t of targets) {
     try {
-      const { plans, extras } = await runAdopt({ harness, cwd, keep: [], dryRun: true, extras: true });
+      const { plans, extras } = await runAdopt({
+        harness: t.harness,
+        cwd,
+        keep: [],
+        dryRun: true,
+        extras: true,
+        install: t.install,
+      });
       const names = plans.flatMap((p) => p.moved);
-      if (names.length) stillDirect.set(harness, [...new Set(names)]);
+      if (names.length) stillDirect.set(t.key, [...new Set(names)]);
       if (extras && (extras.skills.length || extras.plugins.length)) {
-        stillLoaded.set(harness, {
+        stillLoaded.set(t.key, {
           skills: extras.skills.map((x) => x.name),
           plugins: extras.plugins.map((x) => x.name),
         });
@@ -125,7 +172,7 @@ export async function runDoctor(cwd: string): Promise<string> {
   }
 
   /** What one harness still loads itself, in tokens. */
-  const unrealized = (harness: Harness): number => {
+  const unrealized = (harness: string): number => {
     const servers = new Set(stillDirect.get(harness) ?? []);
     // Skills cost context even with every server routed: the harness injects
     // each one's name and description itself. Counting them with the servers is
@@ -156,18 +203,19 @@ export async function runDoctor(cwd: string): Promise<string> {
   // Claude Code for a server that is only still registered in Cursor makes the
   // headline number describe nobody's actual context.
   lines.push("", "  per harness (a session only ever runs in one):");
-  for (const harness of HARNESSES) {
+  const width = Math.max(7, ...targets.map((t) => t.key.length));
+  for (const { key: harness } of targets) {
     if (!stillDirect.has(harness) && !stillLoaded.has(harness)) continue;
     const direct = unrealized(harness);
     const saved = full - routerSurface - direct;
     lines.push(
-      `    ${harness.padEnd(7)} still loaded ~${direct.toLocaleString()}` +
+      `    ${harness.padEnd(width)} still loaded ~${direct.toLocaleString()}` +
         (saved > 0
           ? ` → saves ~${saved.toLocaleString()} (${Math.round((saved / full) * 100)}%)`
           : " → saves nothing yet"),
     );
   }
-  const adopted = HARNESSES.filter((h) => !stillDirect.has(h) && !stillLoaded.has(h));
+  const adopted = targets.map((t) => t.key).filter((h) => !stillDirect.has(h) && !stillLoaded.has(h));
   if (adopted.length) {
     lines.push(
       `    ${adopted.join(", ")}: fully adopted → saves ~${(full - routerSurface).toLocaleString()} (${Math.round(((full - routerSurface) / full) * 100)}%)`,
@@ -178,7 +226,9 @@ export async function runDoctor(cwd: string): Promise<string> {
     lines.push("", "## Not yet adopted");
     lines.push("  These are loaded by a harness directly, so they are injected on every");
     lines.push("  turn regardless of the router:");
-    for (const harness of new Set([...stillDirect.keys(), ...stillLoaded.keys()])) {
+    for (const t of targets) {
+      const harness = t.key;
+      if (!stillDirect.has(harness) && !stillLoaded.has(harness)) continue;
       const parts: string[] = [];
       const servers = stillDirect.get(harness);
       const extra = stillLoaded.get(harness);
@@ -187,7 +237,7 @@ export async function runDoctor(cwd: string): Promise<string> {
       if (extra?.skills.length) parts.push(`skills: ${extra.skills.join(", ")}`);
       lines.push(`  ${harness}`);
       for (const part of parts) lines.push(`    ${part}`);
-      lines.push(`    → autorouter adopt --target ${harness}`);
+      lines.push(`    → ${t.adopt}`);
     }
   }
 
@@ -243,6 +293,13 @@ export async function runDoctor(cwd: string): Promise<string> {
 }
 
 const HARNESSES: Harness[] = ["claude", "codex", "cursor", "vscode"];
+
+/** The active install first, then every other ~/.claude* install found. */
+function claudeInstallsForDoctor(active: ClaudeInstall = claudeInstall()): ClaudeInstall[] {
+  const out = [active];
+  for (const i of discoverClaudeInstalls()) if (!out.some((o) => o.dir === i.dir)) out.push(i);
+  return out;
+}
 
 function truncate(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;

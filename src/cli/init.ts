@@ -3,7 +3,7 @@ import { createInterface } from "node:readline/promises";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { ensureDir, readText, writeText } from "../util/fs.ts";
 import { suggestModel } from "../selector/backends.ts";
-import { homeDir, stripJsonComments } from "../util/paths.ts";
+import { claudeInstall, claudeSettingsPath, homeDir, stripJsonComments } from "../util/paths.ts";
 import { resolveConfig } from "../config/resolve.ts";
 import { ResultStore } from "../server/spill.ts";
 
@@ -44,7 +44,7 @@ export async function runInit(opts: {
 
   switch (opts.harness) {
     case "claude":
-      notes.push(await writeJsonServer(join(homeDir(), ".claude.json"), "mcpServers", opts, env));
+      notes.push(await writeJsonServer(claudeInstall().claudeJson, "mcpServers", opts, env));
       break;
     case "cursor":
       notes.push(await writeJsonServer(join(homeDir(), ".cursor", "mcp.json"), "mcpServers", opts, env));
@@ -74,7 +74,7 @@ async function offerResultsReadRule(yes: boolean): Promise<string> {
   const resolved = await resolveConfig(process.cwd());
   const dir = new ResultStore(resolved.config, resolved.cwd).rootDir;
   const rule = `Read(${readRulePath(dir)}/**)`;
-  const path = join(homeDir(), ".claude", "settings.json");
+  const path = claudeSettingsPath();
   const text = (await readText(path)) ?? "{}";
   let settings: any;
   try {
@@ -177,7 +177,7 @@ async function writeCodexServer(
  */
 async function writePrimer(harness: Harness): Promise<string> {
   const targets: Record<Harness, string> = {
-    claude: join(homeDir(), ".claude", "CLAUDE.md"),
+    claude: join(claudeInstall().dir, "CLAUDE.md"),
     codex: join(homeDir(), ".codex", "AGENTS.md"),
     cursor: join(process.cwd(), ".cursor", "rules", "autorouter.mdc"),
     vscode: join(process.cwd(), ".github", "copilot-instructions.md"),

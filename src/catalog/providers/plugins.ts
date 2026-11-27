@@ -3,6 +3,7 @@ import type { Capability } from "../types.ts";
 import { estimateTokens } from "../types.ts";
 import { parseFrontmatter, keywordsFrom } from "../frontmatter.ts";
 import { listInstalledPlugins } from "../../config/adapters/plugins.ts";
+import { claudeInstall, type ClaudeInstall } from "../../util/paths.ts";
 import { listFiles, readText } from "../../util/fs.ts";
 
 /**
@@ -10,14 +11,14 @@ import { listFiles, readText } from "../../util/fs.ts";
  * markdown-with-frontmatter and are invoked by reading their body, so they are
  * indexed the same way skills are.
  */
-export async function collectPluginAssets(): Promise<{
+export async function collectPluginAssets(install: ClaudeInstall = claudeInstall()): Promise<{
   capabilities: Capability[];
   sources: string[];
 }> {
   const capabilities: Capability[] = [];
   const sources: string[] = [];
 
-  for (const plugin of await listInstalledPlugins()) {
+  for (const plugin of await listInstalledPlugins(install)) {
     for (const [dir, kind] of [
       ["commands", "command"],
       ["agents", "agent"],

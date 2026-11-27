@@ -1,7 +1,7 @@
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { ensureDir, readText, writeText } from "../util/fs.ts";
-import { homeDir, stripJsonComments } from "../util/paths.ts";
+import { claudeInstall, defaultClaudeDir, homeDir, installLabel, stripJsonComments, type ClaudeInstall } from "../util/paths.ts";
 import { resolveConfig } from "../config/resolve.ts";
 import { upsertProjectServers, upsertServers } from "../config/write.ts";
 import type { Harness } from "./init.ts";
@@ -24,6 +24,8 @@ import {
  */
 export type AdoptPlan = {
   harness: Harness;
+  /** For Claude Code, the install (config dir) this plan edits. */
+  configDir?: string;
   file: string;
   section: string;
   moved: string[];
@@ -53,8 +55,14 @@ export async function runAdopt(opts: {
   skillMode?: SkillMode;
   keepSkills?: string[];
   keepPlugins?: string[];
+  /**
+   * The Claude Code install to adopt (default: the active one — CLAUDE_CONFIG_DIR,
+   * else ~/.claude). Ignored for other harnesses.
+   */
+  install?: ClaudeInstall;
 }): Promise<AdoptResult> {
-  const resolved = await resolveConfig(opts.cwd);
+  const install = opts.install ?? claudeInstall();
+  const resolved = await resolveConfig(opts.cwd, { install });
   // alwaysExpose capabilities must stay first-class, so their servers stay put.
   const keep = new Set([
     "autorouter",
@@ -103,7 +111,7 @@ export async function runAdopt(opts: {
       }
     }
   } else {
-    for (const site of jsonSites(opts.harness, opts.cwd)) {
+    for (const site of jsonSites(opts.harness, opts.cwd, install)) {
       // A file may host two sections (~/.claude.json). Parse it once and mutate
       // that one document, so the second section never reads a stale copy.
       if (!docs.has(site.file)) {
@@ -121,6 +129,7 @@ export async function runAdopt(opts: {
       if (!container || typeof container !== "object") continue;
       const plan: AdoptPlan = {
         harness: opts.harness,
+        ...(opts.harness === "claude" ? { configDir: install.dir } : {}),
         file: site.file,
         section: site.section,
         moved: [],
@@ -156,6 +165,7 @@ export async function runAdopt(opts: {
           mode: opts.skillMode ?? "name-only",
           routedServers,
           unreachable: opts.unreachable,
+          install,
         })
       : null;
 
@@ -174,15 +184,22 @@ export async function runAdopt(opts: {
   // settings.json is mutated by applyExtras, so it belongs in the same backup
   // as the server moves — one `restore` has to undo the whole adoption.
   if (extrasCount) {
-    const text = await readText(settingsPath());
-    if (text !== null) backup[settingsPath()] = text;
+    const file = settingsPath(install);
+    const text = await readText(file);
+    if (text !== null) backup[file] = text;
   }
 
   // The backup is written before the first mutation and outside the cache dir,
   // which `reindex` and cleanup tooling are entitled to delete at any time.
-  const backupPath = join(backupDir(), `${opts.harness}-${stamp()}.json`);
+  // Each Claude install gets its own, tagged with its dir, so `restore` undoes
+  // one install without touching the others.
+  const claudeDirTag = opts.harness === "claude" ? install.dir : null;
+  const backupPath = join(backupDir(), backupName(opts.harness, claudeDirTag, install.isDefault));
   await ensureDir(join(backupPath, ".."));
-  await writeText(backupPath, `${JSON.stringify({ harness: opts.harness, files: backup }, null, 2)}\n`);
+  await writeText(
+    backupPath,
+    `${JSON.stringify({ harness: opts.harness, ...(claudeDirTag ? { configDir: claudeDirTag } : {}), files: backup }, null, 2)}\n`,
+  );
 
   const touched = new Set(plans.filter((p) => p.moved.length).map((p) => p.file));
   for (const file of touched) {
@@ -261,19 +278,56 @@ function stamp(): string {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
-export async function runRestore(harness: Harness): Promise<string[]> {
+/**
+ * `<harness>-<stamp>.json`, plus `--<dir name>` for a Claude install other than
+ * the default. The stamp leads, so names still sort by time.
+ */
+function backupName(harness: Harness, configDir: string | null, isDefault: boolean): string {
+  const tag = configDir && !isDefault ? `--${basename(configDir).replace(/[^a-zA-Z0-9._-]+/g, "_")}` : "";
+  return `${harness}-${stamp()}${tag}.json`;
+}
+
+/**
+ * Undoes the most recent adopt of `harness`. For Claude Code that is per
+ * install: only backups taken from `install` (default: the active one) count.
+ * Backups from before installs were tracked carry no configDir and belong to
+ * the default install — the only one adopt could edit then.
+ */
+export async function runRestore(
+  harness: Harness,
+  opts: { install?: ClaudeInstall } = {},
+): Promise<string[]> {
   const dir = backupDir();
+  const install = opts.install ?? claudeInstall();
+  const where = harness === "claude" ? ` in ${installLabel(install)}` : "";
+  const none = [`No adoption backups found for ${harness}${where}.`];
   const { readdir } = await import("node:fs/promises");
   let files: string[];
   try {
-    files = (await readdir(dir)).filter((f) => f.startsWith(`${harness}-`)).sort();
+    files = (await readdir(dir)).filter((f) => f.startsWith(`${harness}-`) && f.endsWith(".json")).sort();
   } catch {
-    return [`No adoption backups found for ${harness}.`];
+    return none;
   }
-  const latest = files.at(-1);
-  if (!latest) return [`No adoption backups found for ${harness}.`];
 
-  const payload = JSON.parse((await readText(join(dir, latest)))!);
+  let latest: string | undefined;
+  let payload: any;
+  for (const name of files.reverse()) {
+    let parsed: any;
+    try {
+      parsed = JSON.parse((await readText(join(dir, name))) ?? "");
+    } catch {
+      continue;
+    }
+    if (harness === "claude") {
+      const owner = typeof parsed?.configDir === "string" ? parsed.configDir : defaultClaudeDir();
+      if (owner !== install.dir) continue;
+    }
+    latest = name;
+    payload = parsed;
+    break;
+  }
+  if (!latest) return none;
+
   const notes: string[] = [];
   for (const [file, text] of Object.entries(payload.files as Record<string, string>)) {
     await writeText(file, text);
@@ -293,13 +347,13 @@ export async function runRestore(harness: Harness): Promise<string[]> {
  * servers are picked up in place instead (workspace/project.ts), and hidden
  * from Claude Code through the repo's own settings.local.json.
  */
-function jsonSites(harness: Harness, cwd: string): JsonSite[] {
+function jsonSites(harness: Harness, cwd: string, install: ClaudeInstall): JsonSite[] {
   switch (harness) {
     case "claude":
       return [
-        { file: join(homeDir(), ".claude.json"), section: "mcpServers", path: ["mcpServers"] },
+        { file: install.claudeJson, section: "mcpServers", path: ["mcpServers"] },
         {
-          file: join(homeDir(), ".claude.json"),
+          file: install.claudeJson,
           section: `projects[${cwd}].mcpServers`,
           path: ["projects", cwd, "mcpServers"],
           project: cwd,

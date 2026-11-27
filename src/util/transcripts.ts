@@ -2,11 +2,11 @@ import { createReadStream } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
-import { homeDir } from "./paths.ts";
+import { claudeInstall } from "./paths.ts";
 
 /**
  * Claude Code's session transcripts: one JSONL file per session under
- * ~/.claude/projects/<slug>/. The format is internal to Claude Code and moves
+ * <config dir>/projects/<slug>/ — ~/.claude, or $CLAUDE_CONFIG_DIR. The format is internal to Claude Code and moves
  * between releases, so everything here reads defensively — a line that does
  * not parse, or an entry type we do not know, is counted and skipped rather
  * than treated as an error.
@@ -14,8 +14,8 @@ import { homeDir } from "./paths.ts";
 
 export type TranscriptFile = { path: string; project: string; mtimeMs: number; size: number };
 
-export function projectsDir(): string {
-  return join(homeDir(), ".claude", "projects");
+export function projectsDir(dir: string = claudeInstall().dir): string {
+  return join(dir, "projects");
 }
 
 /** Claude Code's directory name for a project: every non-alphanumeric becomes "-". */
@@ -28,9 +28,9 @@ export function projectSlug(dir: string): string {
  * wall clock enters, since it decides which files count, never what they say.
  */
 export async function listTranscripts(
-  opts: { days?: number; project?: string; now?: number; limit?: number } = {},
+  opts: { days?: number; project?: string; now?: number; limit?: number; dir?: string } = {},
 ): Promise<TranscriptFile[]> {
-  const root = projectsDir();
+  const root = projectsDir(opts.dir);
   let projects: string[];
   try {
     projects = (await readdir(root)).sort();
@@ -113,8 +113,10 @@ export function hookRunOf(entry: any): HookRun | null {
 }
 
 /** Hook runs from the most recent transcripts, for doctor — a sample, not a census. */
-export async function recentHookRuns(opts: { files?: number; days?: number } = {}): Promise<HookRun[]> {
-  const files = await listTranscripts({ days: opts.days ?? 14, limit: opts.files ?? 40 });
+export async function recentHookRuns(
+  opts: { files?: number; days?: number; dir?: string } = {},
+): Promise<HookRun[]> {
+  const files = await listTranscripts({ days: opts.days ?? 14, limit: opts.files ?? 40, dir: opts.dir });
   const runs: HookRun[] = [];
   for (const f of files) {
     try {
