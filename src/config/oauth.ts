@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import type {
   OAuthClientProvider,
   OAuthDiscoveryState,
@@ -100,10 +100,20 @@ export async function writeAuth(
   const path = authPath(server);
   await mkdir(oauthDir(), { recursive: true, mode: 0o700 });
   const merged = { ...(base ?? (await readAuth(server))), ...patch };
-  await writeFile(path, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
-  // writeFile's mode is only applied on create, so an existing file keeps
-  // whatever permissions it had. These are bearer tokens; be explicit.
-  await chmod(path, 0o600);
+  // Written to a temp file and renamed into place. Several routers share this
+  // file, and readAuth() treats anything unparseable as "no grant": a reader
+  // that caught an in-place write mid-truncate saw {} and then wrote back only
+  // its own patch, wiping the tokens and the client registration.
+  const tmp = `${path}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
+  try {
+    await writeFile(tmp, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+    // The mode above is subject to the umask. These are bearer tokens; be explicit.
+    await chmod(tmp, 0o600);
+    await rename(tmp, path);
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
 }
 
 export async function clearAuth(server: string): Promise<void> {

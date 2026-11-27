@@ -3,11 +3,12 @@ import type { Capability } from "../types.ts";
 import { estimateTokens } from "../types.ts";
 import { parseFrontmatter, keywordsFrom } from "../frontmatter.ts";
 import { absPath, claudeInstall, inClaudeDir, type ClaudeInstall } from "../../util/paths.ts";
-import { findByName, readText } from "../../util/fs.ts";
-import { listInstalledPlugins } from "../../config/adapters/plugins.ts";
+import { findByName, mapLimit, readText } from "../../util/fs.ts";
+import { listInstalledPlugins, type InstalledPlugin } from "../../config/adapters/plugins.ts";
 import { gitRoot, isHome, nestedSkillDirs, projectDirs } from "../../workspace/root.ts";
 
-export type SkillOpts = { includePlugins?: boolean; install?: ClaudeInstall };
+/** `plugins`: the install's plugin list, when the caller already read it for this build. */
+export type SkillOpts = { includePlugins?: boolean; install?: ClaudeInstall; plugins?: InstalledPlugin[] };
 
 export type SkillRoot = { path: string; plugin: string | null; origin: "user" | "project" | "plugin" };
 
@@ -51,7 +52,7 @@ export async function skillRoots(
     }
   }
   if (opts.includePlugins !== false) {
-    for (const plugin of await listInstalledPlugins(install)) {
+    for (const plugin of opts.plugins ?? (await listInstalledPlugins(install))) {
       roots.push({ path: join(plugin.root, "skills"), plugin: plugin.name, origin: "plugin" });
     }
   }
@@ -80,18 +81,28 @@ export async function collectSkills(
   const sources: string[] = roots.filter((r) => !r.plugin).map((r) => r.path);
   const seen = new Set<string>();
 
-  for (const root of roots) {
-    const files = await findByName(root.path, "SKILL.md");
-    for (const file of files) {
-      const cap = await readSkill(file, root.plugin, root.origin);
-      if (!cap || seen.has(cap.id)) continue;
-      seen.add(cap.id);
-      capabilities.push(cap);
-      sources.push(file);
-    }
-  }
+  // The walks and reads run concurrently; the dedupe below runs in root order,
+  // which is the precedence order, so the first root to define a skill still
+  // wins exactly as it did when this was one sequential loop.
+  // Flattened before reading, so the bound covers the whole library rather
+  // than applying per root.
+  const walked = await mapLimit(roots, IO_CONCURRENCY, (root) => findByName(root.path, "SKILL.md"));
+  const files = roots.flatMap((root, i) => walked[i]!.map((file) => ({ root, file })));
+  const read = await mapLimit(files, IO_CONCURRENCY, ({ root, file }) =>
+    readSkill(file, root.plugin, root.origin),
+  );
+  files.forEach(({ file }, i) => {
+    const cap = read[i];
+    if (!cap || seen.has(cap.id)) return;
+    seen.add(cap.id);
+    capabilities.push(cap);
+    sources.push(file);
+  });
   return { capabilities, sources };
 }
+
+/** Directory walks or file reads in flight at once; see mapLimit. */
+const IO_CONCURRENCY = 16;
 
 async function readSkill(
   file: string,

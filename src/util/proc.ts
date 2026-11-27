@@ -38,14 +38,21 @@ export function run(
         : setTimeout(() => {
             timedOut = true;
             child.kill("SIGKILL");
+            // `close` waits for the pipes, and a grandchild that inherited them
+            // keeps them open after the child is dead. Settle now and let go of
+            // the streams, or the timeout is only as good as the slowest
+            // descendant.
+            child.stdout.destroy();
+            child.stderr.destroy();
+            done(() => reject(new Error(`${command} timed out after ${opts.timeoutMs}ms`)));
           }, opts.timeoutMs);
 
-    const done = (fn: () => void) => {
+    function done(fn: () => void) {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
       fn();
-    };
+    }
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");

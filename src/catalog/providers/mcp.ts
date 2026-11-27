@@ -45,7 +45,9 @@ export async function connect(
   const timeout = opts.interactive ? Math.max(timeoutMs, startup) : startup || timeoutMs;
 
   try {
-    await withTimeout(client.connect(transport), timeout, `connect to ${entry.name}`);
+    // The SDK applies its own 60s limit to the initialize request unless told
+    // otherwise, which silently capped any longer startup_timeout_sec.
+    await withTimeout(client.connect(transport, { timeout }), timeout, `connect to ${entry.name}`);
   } catch (err) {
     // A timed-out stdio server is still running; closing the transport is what
     // stops it, and nothing else holds a reference to do so later.
@@ -56,7 +58,7 @@ export async function connect(
 }
 
 function stdioTransport(entry: Extract<ServerEntry, { transport: "stdio" }>, interactive = false) {
-  return new StdioClientTransport({
+  const transport = new StdioClientTransport({
     command: entry.command,
     args: entry.args,
     cwd: entry.cwd,
@@ -65,6 +67,11 @@ function stdioTransport(entry: Extract<ServerEntry, { transport: "stdio" }>, int
     env: { ...(process.env as Record<string, string>), ...(entry.env ?? {}) },
     stderr: interactive ? "inherit" : "pipe",
   });
+  // Piped so a server's logging stays out of the router's own stderr, but a
+  // pipe nobody reads fills up: once it does, a chatty server blocks on its
+  // next log line and stops answering. Discard as it arrives.
+  transport.stderr?.on("data", () => {});
+  return transport;
 }
 
 function httpTransport(entry: Extract<ServerEntry, { transport: "http" }>) {
@@ -130,7 +137,7 @@ export async function enumerateServer(
   const caps = client.getServerCapabilities() ?? {};
 
   if (caps.tools) {
-    for (const tool of await pageThrough((cursor) => client.listTools({ cursor }), "tools")) {
+    for (const tool of await pageThrough((cursor) => client.listTools({ cursor }), "tools", true)) {
       const t = tool as any;
       out.push({
         id: `mcp:${entry.name}/${t.name}`,
@@ -185,6 +192,8 @@ export async function enumerateServer(
 async function pageThrough<K extends "tools" | "prompts" | "resources">(
   fetchPage: (cursor?: string) => Promise<any>,
   key: K,
+  /** Fail rather than return nothing when the first page cannot be fetched. */
+  required = false,
 ): Promise<any[]> {
   const items: any[] = [];
   let cursor: string | undefined;
@@ -193,8 +202,13 @@ async function pageThrough<K extends "tools" | "prompts" | "resources">(
     let page: any;
     try {
       page = await fetchPage(cursor);
-    } catch {
-      break; // Server declared the capability but does not implement the list.
+    } catch (err) {
+      // -32601: the server declared the capability but does not implement the
+      // list. Anything else on the first page of tools is a real failure (a
+      // timeout, a 403), and swallowing it cached the server as having no
+      // tools, with no error to show for it, until the TTL ran out.
+      if (required && !items.length && (err as { code?: number })?.code !== -32601) throw err;
+      break;
     }
     items.push(...(page?.[key] ?? []));
     cursor = page?.nextCursor;

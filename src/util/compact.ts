@@ -28,12 +28,29 @@ export function compactSchema(schema: unknown, opts: CompactOptions = {}): unkno
   return walk(schema, 0, opts.descChars ?? 160, opts.maxDepth ?? 3);
 }
 
-function walk(node: unknown, depth: number, descChars: number, maxDepth: number): unknown {
+/** Keywords whose value maps caller-chosen names to schemas. */
+const NAME_MAPS = new Set(["properties", "patternProperties", "$defs", "definitions"]);
+
+function walk(
+  node: unknown,
+  depth: number,
+  descChars: number,
+  maxDepth: number,
+  names = false,
+): unknown {
   if (Array.isArray(node)) return node.map((v) => walk(v, depth, descChars, maxDepth));
   if (!node || typeof node !== "object") return node;
 
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    // Inside a name map every key is a parameter (or definition) name. A tool
+    // with a `title` or `example` argument must keep it: filtering names with
+    // the keyword rules below deleted real parameters while `required` still
+    // listed them.
+    if (names) {
+      out[key] = walk(value, depth + 1, descChars, maxDepth);
+      continue;
+    }
     if (DROP.has(key)) continue;
     // `additionalProperties: true` is the JSON Schema default and says nothing;
     // `false` is a real constraint the downstream server will enforce, and
@@ -55,8 +72,8 @@ function walk(node: unknown, depth: number, descChars: number, maxDepth: number)
 
     // "properties" and "$defs" are maps of names to schemas, so their keys are
     // data, not structure — the children advance a level, the container does not.
-    const nextDepth = key === "properties" || key === "$defs" || key === "definitions" ? depth : depth + 1;
-    out[key] = walk(value, nextDepth, descChars, maxDepth);
+    const nameMap = NAME_MAPS.has(key) && !!value && typeof value === "object" && !Array.isArray(value);
+    out[key] = walk(value, nameMap ? depth : depth + 1, descChars, maxDepth, nameMap);
   }
   return out;
 }

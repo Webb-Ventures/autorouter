@@ -92,7 +92,18 @@ function parseSimpleYaml(src: string): Record<string, any> {
       pending = { key, indent, parent };
       continue;
     }
-    parent[key] = coerce(value);
+    // A plain scalar may wrap onto following, more-indented lines. Read as
+    // separate lines, only the first survived and a continuation containing a
+    // colon became a junk key.
+    let full = value;
+    while (i + 1 < rawLines.length) {
+      const next = rawLines[i + 1]!;
+      const nextIndent = next.length - next.trimStart().length;
+      if (!next.trim() || nextIndent <= indent) break;
+      i++;
+      if (!next.trim().startsWith("#")) full = `${full} ${next.trim()}`;
+    }
+    parent[key] = coerce(full);
     pending = null;
   }
   return root;

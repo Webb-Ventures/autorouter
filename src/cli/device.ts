@@ -111,7 +111,10 @@ async function errorCode(res: Response): Promise<{ code: string; description?: s
     // Not JSON. Some providers return an HTML error page on a malformed
     // device request; the status line is all there is to report.
   }
-  return { code: `http_${res.status}`, description: text.slice(0, 200) || undefined };
+  return {
+    code: res.ok ? "invalid_response" : `http_${res.status}`,
+    description: text.slice(0, 200) || undefined,
+  };
 }
 
 export type DeviceLoginResult = {
@@ -274,8 +277,12 @@ export async function runDeviceFlow(opts: {
     if (resource) params.set("resource", resource.href);
 
     const res = await doFetch(metadata!.token_endpoint, { method: "POST", headers, body: params });
-    if (res.ok) {
-      const tokens = (await res.json()) as OAuthTokens;
+    // Some providers (GitHub among them) answer 200 with an error body while
+    // the user has not approved yet. Only a body carrying a token is a grant;
+    // storing the other kind looked like a successful login with no token.
+    const body = res.ok ? ((await res.clone().json().catch(() => null)) as Partial<OAuthTokens> | null) : null;
+    if (body?.access_token) {
+      const tokens = body as OAuthTokens;
       await writeAuth(opts.server, {
         tokens,
         ...(opts.scope ? { requestedScope: opts.scope, pinnedScope: opts.settings?.scopes } : {}),

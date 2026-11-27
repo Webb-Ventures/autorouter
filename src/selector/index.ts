@@ -2,7 +2,7 @@ import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { SelectorConfig } from "../config/types.ts";
 import type { Scored } from "../index/search.ts";
 import type { SelectorBackend, SelectorResult } from "./types.ts";
-import { SELECTOR_SYSTEM, buildSelectorUser, parseSelections } from "./prompt.ts";
+import { SELECTOR_SYSTEM, buildSelectorUser, isEmptySelection, parseSelections } from "./prompt.ts";
 import { apiBackend, cliBackend, samplingBackend } from "./backends.ts";
 
 /**
@@ -34,10 +34,12 @@ function remember(key: string, result: SelectorResult): SelectorResult {
   return result;
 }
 
-function cacheKey(query: string, candidates: Scored[]): string {
+function cacheKey(query: string, candidates: Scored[], maxResults: number): string {
   // The candidate ids are part of the key, so a refreshed catalog invalidates
-  // exactly the entries whose answer could actually differ.
-  return `${query.trim().toLowerCase()}\u0000${candidates.map((c) => c.capability.id).join(",")}`;
+  // exactly the entries whose answer could actually differ. So is the limit:
+  // an answer cut to one result is not the answer to the same query asked for
+  // eight.
+  return `${maxResults}\u0000${query.trim().toLowerCase()}\u0000${candidates.map((c) => c.capability.id).join(",")}`;
 }
 
 export type SelectorContext = {
@@ -76,7 +78,7 @@ export async function selectCapabilities(
   // Nothing to narrow: hand back everything rather than paying for a call.
   if (candidates.length <= 2) return fallback("too few candidates to rerank");
 
-  const key = cacheKey(query, candidates);
+  const key = cacheKey(query, candidates, maxResults);
   const hit = cache.get(key);
   if (hit) {
     // Refresh LRU position: a query the model keeps returning to is the one
@@ -100,10 +102,13 @@ export async function selectCapabilities(
     const timeoutMs = Math.max(ctx.config.timeoutMs ?? 20000, backend.minTimeoutMs ?? 0);
     const raw = await backend.complete(SELECTOR_SYSTEM, user, timeoutMs);
     const selections = parseSelections(raw, validIds).slice(0, maxResults);
-    // An empty list is a legitimate answer ("nothing here fits"), but an
-    // unparseable one is not. parseSelections cannot distinguish, so treat a
-    // non-empty response body as an intentional empty selection.
-    if (!selections.length && !raw.trim()) return fallback("selector returned nothing");
+    // An empty list is a legitimate answer ("nothing here fits"). Truncated or
+    // unparseable output, or a list naming only ids that do not exist, is not:
+    // caching that would answer "no capability matched" for the rest of the
+    // session.
+    if (!selections.length && !isEmptySelection(raw)) {
+      return fallback(raw.trim() ? "selector returned an unusable answer" : "selector returned nothing");
+    }
     return remember(key, { selections, backend: backend.id, model: backend.model });
   } catch (err) {
     return fallback(`selector failed: ${err instanceof Error ? err.message : String(err)}`);

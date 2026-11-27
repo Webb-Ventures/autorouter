@@ -2,11 +2,13 @@ import { basename, join, resolve } from "node:path";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import { ensureDir, readText, writeText } from "../util/fs.ts";
 import { claudeInstall, defaultClaudeDir, homeDir, installLabel, stripJsonComments, type ClaudeInstall } from "../util/paths.ts";
-import { resolveConfig } from "../config/resolve.ts";
+import { resolveConfig, type ResolvedConfig } from "../config/resolve.ts";
 import { upsertProjectServers, upsertServers } from "../config/write.ts";
 import type { Harness } from "./init.ts";
+import { isSelfReference, normalizeServer } from "../config/adapters/shared.ts";
 import {
   applyExtras,
+  assertSettingsWritable,
   planExtras,
   settingsPath,
   type ExtrasPlan,
@@ -60,9 +62,22 @@ export async function runAdopt(opts: {
    * else ~/.claude). Ignored for other harnesses.
    */
   install?: ClaudeInstall;
+  /**
+   * The config already resolved for `cwd`, when the caller has it. Doctor and
+   * auto-adopt run one pass per harness and `adopt` a preview then the real
+   * thing; resolving again for each re-read every harness config to learn
+   * nothing new. Only read-only inputs come from it (alwaysExpose, the server
+   * list, the config path); the files adopt rewrites are always read fresh.
+   * Used only when it was resolved for `install`: another install has its own
+   * servers and plugins.
+   */
+  resolved?: ResolvedConfig;
 }): Promise<AdoptResult> {
   const install = opts.install ?? claudeInstall();
-  const resolved = await resolveConfig(opts.cwd, { install });
+  const resolved =
+    opts.resolved && opts.resolved.install.dir === install.dir && opts.resolved.install.claudeJson === install.claudeJson
+      ? opts.resolved
+      : await resolveConfig(opts.cwd, { install });
   // alwaysExpose capabilities must stay first-class, so their servers stay put.
   const keep = new Set([
     "autorouter",
@@ -81,7 +96,12 @@ export async function runAdopt(opts: {
 
   const apply = (site: AdoptPlan, entries: Record<string, any>, target = adopted) => {
     for (const [name, spec] of Object.entries(entries)) {
-      if (keep.has(name)) {
+      // The router's own registration stays in the harness whatever it is
+      // called. Matching the name alone moved an entry called "router" out,
+      // after which resolveConfig drops it as a self-reference: the harness
+      // was left with no router at all.
+      const entry = spec && typeof spec === "object" ? normalizeServer(name, spec, "adopt") : null;
+      if (keep.has(name) || (entry && isSelfReference(entry))) {
         site.kept.push(name);
         continue;
       }
@@ -184,7 +204,10 @@ export async function runAdopt(opts: {
   // settings.json is mutated by applyExtras, so it belongs in the same backup
   // as the server moves — one `restore` has to undo the whole adoption.
   if (extrasCount) {
+    // Checked before anything is written, so a settings file that cannot be
+    // updated stops the adoption whole rather than halfway.
     const file = settingsPath(install);
+    await assertSettingsWritable(file);
     const text = await readText(file);
     if (text !== null) backup[file] = text;
   }
@@ -201,6 +224,15 @@ export async function runAdopt(opts: {
     `${JSON.stringify({ harness: opts.harness, ...(claudeDirTag ? { configDir: claudeDirTag } : {}), files: backup }, null, 2)}\n`,
   );
 
+  // The router's config is written first. If that fails (it throws on a config
+  // it cannot parse) the harness files are untouched; the other order removed
+  // the servers from the harness and then failed to record them anywhere. A
+  // failure after this point leaves a server in both places, which is harmless.
+  if (Object.keys(adopted).length) await upsertServers(adopted, { configPath: resolved.configPath });
+  if (Object.keys(adoptedProject).length) {
+    await upsertProjectServers(resolve(opts.cwd), adoptedProject, { configPath: resolved.configPath });
+  }
+
   const touched = new Set(plans.filter((p) => p.moved.length).map((p) => p.file));
   for (const file of touched) {
     const config = docs.get(file);
@@ -208,11 +240,6 @@ export async function runAdopt(opts: {
       file,
       file.endsWith(".toml") ? stringifyToml(config) : `${JSON.stringify(config, null, 2)}\n`,
     );
-  }
-
-  if (Object.keys(adopted).length) await upsertServers(adopted, { configPath: resolved.configPath });
-  if (Object.keys(adoptedProject).length) {
-    await upsertProjectServers(resolve(opts.cwd), adoptedProject, { configPath: resolved.configPath });
   }
   if (extras && extrasCount) await applyExtras(extras);
 
@@ -258,7 +285,7 @@ export async function runAutoAdopt(cwd: string): Promise<string[]> {
   for (const harness of HARNESSES) {
     if (!resolved.config.import.includes(harness)) continue;
     try {
-      const result = await runAdopt({ harness, cwd, keep: [], dryRun: false, extras: false });
+      const result = await runAdopt({ harness, cwd, keep: [], dryRun: false, extras: false, resolved });
       const moved = result.plans.flatMap((p) => p.moved);
       if (moved.length) notes.push(`adopted ${moved.join(", ")} from ${harness}`);
     } catch {

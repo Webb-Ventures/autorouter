@@ -14,6 +14,11 @@ function hinted(server: string, err: unknown, entry?: ServerEntry): Error {
   return hint === raw ? (err instanceof Error ? err : new Error(raw)) : new Error(hint);
 }
 
+/** Whether two entries launch or reach the same thing (origin is bookkeeping). */
+function sameTarget(a: ServerEntry, b: ServerEntry): boolean {
+  return JSON.stringify({ ...a, origin: "" }) === JSON.stringify({ ...b, origin: "" });
+}
+
 /**
  * Lazily-opened, reused connections to downstream servers. Nothing is spawned
  * until a capability from that server is actually called, which is what makes
@@ -36,17 +41,26 @@ export class ConnectionPool {
   }
 
   /**
-   * Replaces the known servers, dropping every live connection.
+   * Replaces the known servers, dropping the connections that no longer match.
    *
    * Called on refresh, because the set of servers is not fixed for the life of
-   * the process — one can be added while it runs. Closing the old clients is
-   * the point rather than a side effect: an entry may have been edited in place
-   * (a new URL, a new env block), and a pooled connection to the old target
-   * would keep answering as if nothing changed.
+   * the process — one can be added while it runs. An entry edited in place (a
+   * new URL, a new env block) or removed has its client closed, since a pooled
+   * connection to the old target would keep answering as if nothing changed.
+   * Unchanged entries keep theirs: a refresh runs whenever any watched config
+   * file changes, and closing every client each time failed whatever call
+   * happened to be in flight.
    */
   setEntries(entries: ServerEntry[]): void {
-    this.reset();
-    this.byName = new Map(entries.map((e) => [e.name, e]));
+    const next = new Map(entries.map((e) => [e.name, e]));
+    for (const [name, client] of this.clients) {
+      const before = this.byName.get(name);
+      const after = next.get(name);
+      if (before && after && sameTarget(before, after)) continue;
+      this.clients.delete(name);
+      void client.then((c) => c.close()).catch(() => {});
+    }
+    this.byName = next;
   }
 
   async get(serverName: string): Promise<Client> {
@@ -55,7 +69,11 @@ export class ConnectionPool {
       try {
         return await existing;
       } catch {
-        this.clients.delete(serverName);
+        // Only evict the promise that failed. A concurrent caller may already
+        // have replaced it with a fresh connection, and deleting that one
+        // orphans a live client nobody will close.
+        if (this.clients.get(serverName) === existing) this.clients.delete(serverName);
+        else return this.get(serverName);
       }
     }
     const entry = this.byName.get(serverName);
@@ -72,7 +90,7 @@ export class ConnectionPool {
     try {
       return await pending;
     } catch (err) {
-      this.clients.delete(serverName);
+      if (this.clients.get(serverName) === pending) this.clients.delete(serverName);
       // A grant can expire between a reindex and a call, so the actionable
       // message has to exist on this path too, not just at index time.
       throw hinted(serverName, err, entry);
@@ -135,7 +153,7 @@ export class ConnectionPool {
     await Promise.all(
       clients.map(async (p) => {
         try {
-          (await p).close();
+          await (await p).close();
         } catch {}
       }),
     );

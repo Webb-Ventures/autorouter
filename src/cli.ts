@@ -10,7 +10,7 @@ import { runAdd, runRemove } from "./cli/add.ts";
 import { runLogin, summarizeScopes } from "./cli/login.ts";
 import { runUpdate } from "./cli/update.ts";
 import { clearAuth, hasAuth, readAuth } from "./config/oauth.ts";
-import { resolveConfig } from "./config/resolve.ts";
+import { resolveConfig, type ResolvedConfig } from "./config/resolve.ts";
 import type { ServerEntry } from "./config/types.ts";
 import { renderCapability, renderRouteResult, oneLine } from "./server/render.ts";
 import type { CapabilityKind } from "./catalog/types.ts";
@@ -18,6 +18,8 @@ import { loadCatalog } from "./catalog/build.ts";
 import { tuneConnectionRacing } from "./util/net.ts";
 import { absPath, claudeInstall, discoverClaudeInstalls, installLabel, type ClaudeInstall } from "./util/paths.ts";
 import { existsSync } from "node:fs";
+import { ask } from "./util/ask.ts";
+import { which } from "./util/proc.ts";
 import { workspaceRoot } from "./workspace/root.ts";
 import { cmdAdoptProject, cmdApprove, cmdRepair, cmdRestoreProject, projectFlag } from "./cli/project.ts";
 
@@ -242,14 +244,16 @@ async function main(argv: string[]): Promise<number> {
 }
 
 async function cmdAdd(name: string | undefined, flags: Flags, rest: string[]): Promise<number> {
+  // Passed whole, "npx -y foo" was spawned as a program of that name.
+  const fromFlag = flags.command ? splitCommand(flags.command) : null;
   try {
     const result = await runAdd({
       name,
       url: flags.url as string | undefined,
       // Either form of stdio entry: --command "npx -y foo" as one string, or the
       // argv after a bare --, which is what people copy out of a README.
-      command: (flags.command as string | undefined) ?? rest[0],
-      args: flags.command ? undefined : rest.slice(1),
+      command: fromFlag ? fromFlag[0] : rest[0],
+      args: fromFlag ? fromFlag.slice(1) : rest.slice(1),
       json: flags.json as string | undefined,
     }, process.cwd(), {
       // stderr, so stdout carries only the result line.
@@ -637,11 +641,21 @@ async function cmdAdopt(flags: Flags): Promise<number> {
   // would silently delete a working capability, usually an OAuth server whose
   // token the harness holds and we do not. Resolve this before planning so the
   // plan itself can exclude them.
-  type Planned = { install: ClaudeInstall | undefined; unreachable: Map<string, string>; total: number; extrasTotal: number };
+  type Planned = {
+    install: ClaudeInstall | undefined;
+    resolved: ResolvedConfig;
+    unreachable: Map<string, string>;
+    total: number;
+    extrasTotal: number;
+  };
   const planned: Planned[] = [];
   const blocked = new Set<string>();
   for (const install of targets.installs) {
     const unreachable = await unreachableServers(install);
+    // Resolved once per install, for the preview and the apply below: the
+    // apply re-reads the files it rewrites, so this only spares re-reading
+    // every harness config.
+    const resolved = await resolveConfig(process.cwd(), { install });
     const preview = await runAdopt({
       harness,
       cwd: process.cwd(),
@@ -649,12 +663,13 @@ async function cmdAdopt(flags: Flags): Promise<number> {
       dryRun: true,
       unreachable: new Set(unreachable.keys()),
       install,
+      resolved,
       ...extrasOpts,
     });
     const total = preview.plans.reduce((n, p) => n + p.moved.length, 0);
     const extras = preview.extras;
     const extrasTotal = (extras?.skills.length ?? 0) + (extras?.plugins.length ?? 0);
-    planned.push({ install, unreachable, total, extrasTotal });
+    planned.push({ install, resolved, unreachable, total, extrasTotal });
     header(install);
     if (!total && !extrasTotal) {
       console.log(preview.notes.join("\n"));
@@ -717,7 +732,7 @@ async function cmdAdopt(flags: Flags): Promise<number> {
       .join(", ");
     const across = planned.filter((p) => p.total || p.extrasTotal).length;
     const answer = (
-      await rl.question(`\nMove ${what}${across > 1 ? ` across ${across} installs` : ""} behind the router? [y/N] `)
+      (await ask(rl, `\nMove ${what}${across > 1 ? ` across ${across} installs` : ""} behind the router? [y/N] `)) ?? ""
     ).trim().toLowerCase();
     rl.close();
     if (answer !== "y" && answer !== "yes") {
@@ -735,6 +750,7 @@ async function cmdAdopt(flags: Flags): Promise<number> {
       dryRun: false,
       unreachable: new Set(p.unreachable.keys()),
       install: p.install,
+      resolved: p.resolved,
       ...extrasOpts,
     });
     if (labelled && p.install) console.log(`\n== ${installLabel(p.install)} ==`);
@@ -807,6 +823,13 @@ function parseArgs(argv: string[]): {
         !(name === "json" && command === "add");
       if (boolean) {
         flags[name] = true as any;
+      } else if (inline === undefined && (argv[i + 1] === undefined || argv[i + 1]!.startsWith("--"))) {
+        // Present with no value, which is how `--project` means "this
+        // directory". Taking the next argument regardless turned
+        // `--project --dry-run` into a project called "--dry-run" and dropped
+        // the dry run, so the adoption was applied for real. A repeated
+        // --config-dir keeps the values it already has.
+        flags[name] = name === "config-dir" ? flags[name] : undefined;
       } else {
         const value = inline !== undefined ? inline : argv[++i];
         // --config-dir may be repeated; every occurrence counts.
@@ -818,6 +841,18 @@ function parseArgs(argv: string[]): {
     else positionals.push(arg);
   }
   return { command, positionals, flags, rest };
+}
+
+/**
+ * Splits `--command "npx -y foo"` into a command and its arguments, honouring
+ * quotes. A string that is itself an executable (a path with spaces in it) is
+ * left whole.
+ */
+function splitCommand(value: string): string[] {
+  if (!/\s/.test(value.trim()) || which(value)) return [value];
+  const out: string[] = [];
+  for (const m of value.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)) out.push(m[1] ?? m[2] ?? m[3]!);
+  return out;
 }
 
 function splitOnce(s: string, sep: string): [string, string | undefined] {

@@ -58,7 +58,12 @@ function buildDoc(cap: Capability): Doc {
       length += weight;
     }
   };
-  add(`${cap.name} ${cap.title ?? ""} ${cap.server ?? ""}`, FIELD_WEIGHTS.name);
+  // One field at a time: tokenize() only emits an identifier's joined form
+  // ("executesql") for text with no whitespace, so concatenating the three
+  // fields silently lost it and exact tool-name queries stopped matching.
+  add(cap.name, FIELD_WEIGHTS.name);
+  add(cap.title ?? "", FIELD_WEIGHTS.name);
+  add(cap.server ?? "", FIELD_WEIGHTS.name);
   add(cap.keywords.join(" "), FIELD_WEIGHTS.keywords);
   add(cap.description, FIELD_WEIGHTS.description);
   add(schemaText(cap.inputSchema), FIELD_WEIGHTS.schema);

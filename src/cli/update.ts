@@ -126,6 +126,18 @@ export function detectInstall(
           : null;
   if (globalManager) return { kind: "global", manager: globalManager, dir: root };
 
+  // pnpm keeps a project's packages in <project>/node_modules/.pnpm/<pkg>@x/
+  // node_modules/<pkg>, so the directory above this package's node_modules is
+  // the store entry, not the project, and has no package.json. Read that way
+  // it looked like an npm global install and was upgraded with `npm i -g`.
+  const pnpmStore = path.indexOf("/node_modules/.pnpm/");
+  if (pnpmStore !== -1) {
+    const projectDir = root.slice(0, pnpmStore);
+    if (exists(join(projectDir, "package.json"))) {
+      return { kind: "project", manager: "pnpm", dir: root, projectDir };
+    }
+  }
+
   if (nodeModules.split(sep).pop() === "node_modules") {
     // A project install has a package.json one level above its node_modules; a
     // global root does not. That single file is the whole distinction, and it
