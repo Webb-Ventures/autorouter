@@ -2,10 +2,12 @@ import { join, basename, dirname, isAbsolute } from "node:path";
 import type { Capability } from "../types.ts";
 import { estimateTokens } from "../types.ts";
 import { parseFrontmatter, keywordsFrom } from "../frontmatter.ts";
-import { absPath } from "../../util/paths.ts";
+import { absPath, claudeInstall, inClaudeDir, type ClaudeInstall } from "../../util/paths.ts";
 import { findByName, readText } from "../../util/fs.ts";
 import { listInstalledPlugins } from "../../config/adapters/plugins.ts";
 import { gitRoot, isHome, nestedSkillDirs, projectDirs } from "../../workspace/root.ts";
+
+export type SkillOpts = { includePlugins?: boolean; install?: ClaudeInstall };
 
 export type SkillRoot = { path: string; plugin: string | null; origin: "user" | "project" | "plugin" };
 
@@ -18,12 +20,18 @@ export type SkillRoot = { path: string; plugin: string | null; origin: "user" | 
  * `<subdir>/.claude/skills` is added too — Claude Code only loads those after it
  * touches a file in the subdirectory, but the router can search them for free.
  * In the home directory a relative path names user skills, not project ones.
+ *
+ * `~/.claude/...` paths belong to the Claude Code install: under
+ * CLAUDE_CONFIG_DIR=~/.claude-bts the default `~/.claude/skills` means
+ * `~/.claude-bts/skills`, and plugins come from that install too.
  */
 export async function skillRoots(
   skillPaths: string[],
   cwd: string,
-  opts: { includePlugins?: boolean } = {},
+  opts: SkillOpts = {},
 ): Promise<SkillRoot[]> {
+  const install = opts.install ?? claudeInstall();
+  skillPaths = skillPaths.map((p) => inClaudeDir(p, install));
   const roots: SkillRoot[] = [];
   const projectRel = skillPaths.filter((p) => !isAbsolute(p) && !p.startsWith("~"));
   for (const p of skillPaths) {
@@ -43,7 +51,7 @@ export async function skillRoots(
     }
   }
   if (opts.includePlugins !== false) {
-    for (const plugin of await listInstalledPlugins()) {
+    for (const plugin of await listInstalledPlugins(install)) {
       roots.push({ path: join(plugin.root, "skills"), plugin: plugin.name, origin: "plugin" });
     }
   }
@@ -62,7 +70,7 @@ export async function skillRoots(
 export async function collectSkills(
   skillPaths: string[],
   cwd: string,
-  opts: { includePlugins?: boolean } = {},
+  opts: SkillOpts = {},
 ): Promise<{ capabilities: Capability[]; sources: string[] }> {
   // Plugin roots are namespaced by plugin. Keeping them separate is what lets a
   // caller that disabled the plugins importer actually see no plugin skills.

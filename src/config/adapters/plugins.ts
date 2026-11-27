@@ -1,7 +1,7 @@
 import { join, dirname, isAbsolute } from "node:path";
 import type { ServerEntry } from "../types.ts";
 import { normalizeServer, type RawServer } from "./shared.ts";
-import { homeDir, readJson } from "../../util/paths.ts";
+import { claudeInstall, readJson, type ClaudeInstall } from "../../util/paths.ts";
 
 export type InstalledPlugin = {
   /** "datadog@claude-plugins-official" */
@@ -14,11 +14,15 @@ type InstalledPluginsFile = {
   plugins?: Record<string, Array<{ installPath?: string }>>;
 };
 
-/** Resolves every installed Claude Code plugin to its on-disk root. */
-export async function listInstalledPlugins(): Promise<InstalledPlugin[]> {
-  const cfg = await readJson<InstalledPluginsFile>(
-    join(homeDir(), ".claude", "plugins", "installed_plugins.json"),
-  );
+export function installedPluginsPath(install: ClaudeInstall = claudeInstall()): string {
+  return join(install.dir, "plugins", "installed_plugins.json");
+}
+
+/** Resolves every Claude Code plugin installed in `install` to its on-disk root. */
+export async function listInstalledPlugins(
+  install: ClaudeInstall = claudeInstall(),
+): Promise<InstalledPlugin[]> {
+  const cfg = await readJson<InstalledPluginsFile>(installedPluginsPath(install));
   const out: InstalledPlugin[] = [];
   for (const [key, entries] of Object.entries(cfg?.plugins ?? {})) {
     const installPath = entries?.[0]?.installPath;
@@ -33,9 +37,11 @@ export async function listInstalledPlugins(): Promise<InstalledPlugin[]> {
  * which is either an inline object or a path to a separate JSON file relative
  * to the plugin root. Both forms appear in the official marketplace.
  */
-export async function loadPluginServers(): Promise<ServerEntry[]> {
+export async function loadPluginServers(
+  install: ClaudeInstall = claudeInstall(),
+): Promise<ServerEntry[]> {
   const out: ServerEntry[] = [];
-  for (const plugin of await listInstalledPlugins()) {
+  for (const plugin of await listInstalledPlugins(install)) {
     const manifestPath = join(plugin.root, ".claude-plugin", "plugin.json");
     const manifest = await readJson<{ mcpServers?: string | Record<string, RawServer> }>(manifestPath);
     if (!manifest?.mcpServers) continue;

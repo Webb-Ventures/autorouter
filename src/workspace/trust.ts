@@ -1,5 +1,5 @@
 import { dirname, join, resolve, basename } from "node:path";
-import { homeDir, readJson } from "../util/paths.ts";
+import { claudeInstall, claudeSettingsPath, homeDir, readJson, type ClaudeInstall } from "../util/paths.ts";
 import { readText } from "../util/fs.ts";
 import { writeText, ensureDir } from "../util/fs.ts";
 import { specKey } from "../config/adapters/shared.ts";
@@ -78,11 +78,12 @@ export async function approveServers(root: string, entries: ServerEntry[]): Prom
   await writeText(approvalsPath(), `${JSON.stringify(sortKeys(all), null, 2)}\n`);
 }
 
-export async function mcpjsonApproval(root: string): Promise<McpjsonApproval> {
+export async function mcpjsonApproval(
+  root: string,
+  install: ClaudeInstall = claudeInstall(),
+): Promise<McpjsonApproval> {
   const abs = resolve(root);
-  const claude = await readJson<{ projects?: Record<string, ProjectState> }>(
-    join(homeDir(), ".claude.json"),
-  );
+  const claude = await readJson<{ projects?: Record<string, ProjectState> }>(install.claudeJson);
   const main = await mainCheckout(abs);
   const project = claude?.projects?.[abs] ?? {};
   const trusted =
@@ -92,7 +93,7 @@ export async function mcpjsonApproval(root: string): Promise<McpjsonApproval> {
   // same rule Claude Code applies, since otherwise the repo approves itself.
   const scopes: (SettingsLike | null)[] = [
     project,
-    await readJson<SettingsLike>(join(homeDir(), ".claude", "settings.json")),
+    await readJson<SettingsLike>(claudeSettingsPath(install)),
     await readJson<SettingsLike>(join(abs, ".claude", "settings.local.json")),
     trusted ? await readJson<SettingsLike>(join(abs, ".claude", "settings.json")) : null,
   ];

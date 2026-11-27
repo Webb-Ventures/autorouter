@@ -98,6 +98,32 @@ costs a Claude Code session nothing. Every removal is backed up verbatim to
 `~/.autorouter/adopted/` before anything is written;
 `autorouter restore --target claude` puts it back byte for byte.
 
+### More than one Claude Code install
+
+Claude Code reads everything from one config dir: `~/.claude`, or
+`$CLAUDE_CONFIG_DIR` when that is set. The router follows the same rule for
+`settings.json`, `skills/`, `plugins/`, transcripts (`projects/`) and
+`CLAUDE.md`. It also follows Claude Code's rule for the state file that holds
+`mcpServers`: that file is `~/.claude.json` for the default install, but
+`$CLAUDE_CONFIG_DIR/.claude.json` inside the dir for any other. A router
+launched by `CLAUDE_CONFIG_DIR=~/.claude-work claude` indexes that install's
+skills and servers, keeps its own catalog, and `adopt`/`restore` edit that
+install.
+
+To adopt several installs in one command, name them, or let the router find
+every `~/.claude*` dir holding a `settings.json` or `.claude.json`:
+
+```sh
+autorouter adopt --target claude --all-claude-dirs --dry-run
+autorouter adopt --target claude --config-dir ~/.claude-work --config-dir ~/.claude-alt
+autorouter restore --target claude --all-claude-dirs   # each install's own latest backup
+```
+
+`--keep`, `--keep-skill`, `--keep-plugin`, `--servers-only` and `--dry-run` apply
+to every install named. Each install gets its own backup, and `restore` undoes
+each install separately. `doctor` lists every install, says whether the router
+is registered in it, and shows what each still loads.
+
 Doctor also reports what costs context but no `adopt` can move. It only reports
 and suggests; it never edits these:
 
@@ -238,7 +264,7 @@ skills are searchable but not republished by default, because the prompt list
 that would carry them is permanent context — see [Slash commands](#slash-commands).
 
 Harness configs are imported rather than duplicated: `~/.claude.json` (global and
-per-project) and the repo's `.mcp.json` (see [Repo skills and servers](#repo-skills-and-servers)), `~/.codex/config.toml`, `~/.cursor/mcp.json`,
+per-project; `$CLAUDE_CONFIG_DIR/.claude.json` under another install) and the repo's `.mcp.json` (see [Repo skills and servers](#repo-skills-and-servers)), `~/.codex/config.toml`, `~/.cursor/mcp.json`,
 `~/.vscode/mcp.json`, and installed Claude Code plugins. While the
 cmux terminal is running, its Computer Use server
 (`cmux-cua`) is picked up too, since cmux injects it per session rather than
@@ -356,7 +382,9 @@ Env overrides (`AUTOROUTER_IMPORT`, `AUTOROUTER_SELECTOR_MODEL`,
 `AUTOROUTER_EMBEDDINGS_PROVIDER`, `AUTOROUTER_RESULTS_MODE`,
 `AUTOROUTER_SPILL_OVER_TOKENS`, …) let each harness
 pin its own behaviour without a shared global file. `AUTOROUTER_HOME` redirects
-every home-relative path, for tests and containers.
+every home-relative path, for tests and containers. Under it, a
+`CLAUDE_CONFIG_DIR` pointing outside that home is ignored, so a test run can
+never reach a real install.
 
 ## Slash commands
 
@@ -534,6 +562,7 @@ autorouter adopt --target claude --dry-run          # preview, change nothing
 autorouter adopt --target claude --servers-only     # skip skills and plugins
 autorouter adopt --target claude --keep project-tools --keep-plugin ui-toolkit
 autorouter restore --target claude                  # undo the most recent adopt
+autorouter adopt --target claude --all-claude-dirs  # every ~/.claude* install (or --config-dir D, repeatable)
 autorouter adopt --project                          # route this repo's .mcp.json servers and skills
 autorouter restore --project                        # take that back
 autorouter approve playwright                       # let the router launch a repo stdio server
@@ -760,7 +789,8 @@ spelled out and requires the model to re-issue with `confirm: true`; and every
 result is prefixed with the resolved `server/tool` so the transcript stays
 auditable.
 
-Adopting skills and plugins edits `~/.claude/settings.json`, a file you also edit
+Adopting skills and plugins edits `~/.claude/settings.json` (or the install's own
+`settings.json`), a file you also edit
 by hand. The whole file is backed up verbatim alongside the server moves and
 `restore` rewrites it byte for byte, but it is a shared file and worth knowing
 about. Hidden skills default to `name-only` for the same reason: Claude can
