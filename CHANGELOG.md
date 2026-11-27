@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `login --read-only` no longer grants Gmail's full-access scopes. Google's
+  scopes are URLs with no word like "write" in them, so 15 of the Gmail MCP
+  server's 20 were classed as read — `https://mail.google.com/` (the whole
+  mailbox, permanent delete included), `gmail.send`, `gmail.compose`,
+  `gmail.drafts`, `gmail.labels`, `gmail.messages` and the settings scopes
+  among them — and `--read-only` would have requested all of those while
+  `--list-scopes` labelled them "read". Under
+  `https://www.googleapis.com/auth/` a scope is now read-only only when it
+  ends in `.readonly` (plus `gmail.metadata` and the `userinfo` pair), and any
+  other URL-shaped scope counts as write unless its path says `read` or
+  `readonly`. `send`, `compose`, `insert`, `import`, `remove` and `edit` are
+  recognised as mutating in every scope style. For Gmail, `--read-only` now
+  requests exactly six scopes.
 - A stdio server that timed out while connecting is now stopped. It was left
   running, one more copy per reindex.
 - Hidden skills are invocable by Claude again. Adopt hid them as

@@ -18,7 +18,7 @@ import {
 } from "../src/config/oauth.ts";
 import { normalizeServer } from "../src/config/adapters/shared.ts";
 import { chooseScopes, summarizeScopes } from "../src/cli/login.ts";
-import { isReadOnlyScope, requestableScopes } from "../src/config/scopes.ts";
+import { isReadOnlyScope, readOnlyScopes, requestableScopes } from "../src/config/scopes.ts";
 
 let home: string;
 const prevHome = process.env.AUTOROUTER_HOME;
@@ -428,6 +428,98 @@ describe("scope selection", () => {
     // read-only just because the word "write" is absent.
     expect(isReadOnlyScope("mcp_all")).toBe(false);
     expect(isReadOnlyScope("mcp_read")).toBe(true);
+  });
+
+  // Verbatim from https://gmailmcp.googleapis.com/.well-known/oauth-protected-resource/mcp/v1
+  const G = "https://www.googleapis.com/auth/";
+  const GMAIL_READ = [
+    `${G}gmail.drafts.readonly`,
+    `${G}gmail.labels.readonly`,
+    `${G}gmail.messages.readonly`,
+    `${G}gmail.metadata`,
+    `${G}gmail.readonly`,
+    `${G}gmail.settings.filters.readonly`,
+  ];
+  const GMAIL_WRITE = [
+    "https://mail.google.com/",
+    `${G}gmail.compose`,
+    `${G}gmail.drafts`,
+    `${G}gmail.drafts.create`,
+    `${G}gmail.labels`,
+    `${G}gmail.labels.create`,
+    `${G}gmail.messages`,
+    `${G}gmail.messages.delete`,
+    `${G}gmail.messages.modify`,
+    `${G}gmail.modify`,
+    `${G}gmail.send`,
+    `${G}gmail.send.self`,
+    `${G}gmail.settings.basic`,
+    `${G}gmail.settings.filters`,
+  ];
+  const GMAIL = [...GMAIL_WRITE, ...GMAIL_READ].sort();
+
+  test("Google scopes are read-only only when they say so", () => {
+    // Regression: none of these carries a word like "write", so 15 of Gmail's
+    // 20 scopes were labelled read — the full-mailbox scope among them — and
+    // --read-only would have granted permanent delete while looking restricted.
+    expect(GMAIL).toHaveLength(20);
+    for (const s of GMAIL_WRITE) expect([s, isReadOnlyScope(s)]).toEqual([s, false]);
+    for (const s of GMAIL_READ) expect([s, isReadOnlyScope(s)]).toEqual([s, true]);
+    expect(readOnlyScopes(GMAIL)).toEqual(GMAIL_READ);
+    expect(chooseScopes(GMAIL, { readOnly: true })).toEqual({ scope: GMAIL_READ.join(" ") });
+    expect(summarizeScopes(`https://mail.google.com/ ${G}gmail.readonly`)).not.toContain("read-only)");
+
+    // The suffix is Google's convention, so it holds across products, and it
+    // outranks a product name that happens to contain a mutating word.
+    expect(isReadOnlyScope(`${G}calendar.readonly`)).toBe(true);
+    expect(isReadOnlyScope(`${G}calendar`)).toBe(false);
+    expect(isReadOnlyScope(`${G}drive`)).toBe(false);
+    expect(isReadOnlyScope(`${G}drive.metadata`)).toBe(false); // edits metadata, unlike gmail.metadata
+    expect(isReadOnlyScope(`${G}drive.metadata.readonly`)).toBe(true);
+    expect(isReadOnlyScope(`${G}admin.directory.user.readonly`)).toBe(true);
+    expect(isReadOnlyScope(`${G}admin.directory.user`)).toBe(false);
+    expect(isReadOnlyScope(`${G}cloud-platform`)).toBe(false);
+    expect(isReadOnlyScope(`${G}cloud-platform.read-only`)).toBe(true);
+    expect(isReadOnlyScope(`${G}devstorage.read_only`)).toBe(true);
+    expect(isReadOnlyScope(`${G}devstorage.read_write`)).toBe(false);
+    expect(isReadOnlyScope(`${G}logging.read`)).toBe(true);
+    // "readonly" has to be the suffix, not just somewhere in the name.
+    expect(isReadOnlyScope(`${G}gmail.readonly.extended`)).toBe(false);
+    expect(isReadOnlyScope(`${G}gmailreadonly`)).toBe(false);
+
+    // Sign-in scopes identify the user and touch nothing.
+    for (const s of ["openid", "email", "profile", `${G}userinfo.email`, `${G}userinfo.profile`]) {
+      expect([s, isReadOnlyScope(s)]).toEqual([s, true]);
+    }
+  });
+
+  test("a URL scope with no read-only marker counts as write", () => {
+    // Bare product URLs are the widest grants a provider has.
+    expect(isReadOnlyScope("https://mail.google.com/")).toBe(false);
+    expect(isReadOnlyScope("https://www.google.com/m8/feeds")).toBe(false);
+    expect(isReadOnlyScope("https://graph.microsoft.com/.default")).toBe(false);
+    expect(isReadOnlyScope("api://0f1e2d3c/access_as_user")).toBe(false);
+    // A marker in the path counts; one in the host does not.
+    expect(isReadOnlyScope("https://graph.microsoft.com/Mail.Read")).toBe(true);
+    expect(isReadOnlyScope("https://graph.microsoft.com/Mail.ReadWrite")).toBe(false);
+    expect(isReadOnlyScope("https://graph.microsoft.com/Mail.Send")).toBe(false);
+    expect(isReadOnlyScope("https://api.example.com/auth/items.readonly")).toBe(true);
+    expect(isReadOnlyScope("https://read.example.com/everything")).toBe(false);
+    expect(isReadOnlyScope("https://readonly.example.com/")).toBe(false);
+    // A marker does not rescue a scope that also names a mutation.
+    expect(isReadOnlyScope("https://api.example.com/read/write")).toBe(false);
+    // Only googleapis.com/auth/ gets Google's rule; a lookalike host does not.
+    expect(isReadOnlyScope("https://www.googleapis.com.example.com/auth/admin.readonly")).toBe(false);
+  });
+
+  test("verbs that mutate without saying write", () => {
+    for (const s of ["mail.send", "send:mail", "messages:compose", "rows.insert", "data_import", "members:remove", "pages.edit"]) {
+      expect([s, isReadOnlyScope(s)]).toEqual([s, false]);
+    }
+    // Whole words only: these merely contain one.
+    for (const s of ["editor:read", "sender.read", "important:read", "removed_items:read"]) {
+      expect([s, isReadOnlyScope(s)]).toEqual([s, true]);
+    }
   });
 
   test("--read-only keeps only the non-mutating scopes", () => {
